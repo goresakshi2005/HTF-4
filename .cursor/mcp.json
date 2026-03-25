@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "agentic-cicd-orchestrator": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mcp_server.main"
+      ],
+      "cwd": "C:\\Users\\Lenovo\\Desktop\\HTF",
+      "env": {
+        "OPENAI_MODEL": "gpt-4o-mini"
+      }
+    }
+  }
+}
+
