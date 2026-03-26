@@ -21,9 +21,12 @@ Rules:
 - patch must be valid unified diff with file headers:
   --- a/<path>
   +++ b/<path>
+- Include at least ONE unchanged context line above and below each changed block.
+- Use the exact indentation and spaces as shown in the provided file contents.
+- Hunk headers (@@ -old_start,old_count +new_start,new_count @@) must reflect the actual line numbers in the file.
 - Only include files that already exist in provided file contents.
 - Keep patch minimal and focused on fixing failing tests/build.
-- Do not include markdown fences.
+- Do not include markdown fences (```).
 - Prefer using the relevant line-grounded context below when selecting exact lines for patch hunks.
 """
 

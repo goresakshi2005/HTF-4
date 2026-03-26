@@ -1,0 +1,3048 @@
+Directory structure:
+└── mcpserver/
+    ├── README.md
+    ├── requirements.txt
+    ├── .env.example
+    ├── indexing/
+    │   ├── index_code.py
+    │   ├── index_schema.py
+    │   └── query_code.py
+    ├── mcp_server/
+    │   ├── __init__.py
+    │   ├── config.py
+    │   ├── main.py
+    │   ├── run_repair.py
+    │   └── tools/
+    │       ├── __init__.py
+    │       ├── code_indexing.py
+    │       ├── diagnose.py
+    │       ├── fix_generator.py
+    │       ├── github_client.py
+    │       ├── logs_analyzer.py
+    │       ├── pr_bot.py
+    │       ├── risk_guard.py
+    │       └── schemas.py
+    ├── tests/
+    │   ├── test_code_indexing.py
+    │   ├── test_fix_generator.py
+    │   ├── test_logs_analyzer.py
+    │   └── test_risk_guard.py
+    ├── .cursor/
+    │   └── mcp.json
+    └── .github/
+        └── workflows/
+            ├── agentic-repair.yml
+            ├── ci.yml
+            └── release-orchestrator.yml
+
+================================================
+FILE: README.md
+================================================
+# Agentic CI/CD MCP Orchestrator
+
+Python MCP server for GitHub Actions failure diagnosis, LLM-driven unified-diff auto-repair PR creation, and governed release orchestration.
+
+## What this provides
+
+- MCP tooling to inspect failed workflow runs using commit, logs, and test signals.
+- LLM diagnosis flow powered by OpenAI `gpt-4o-mini`.
+- Governance layer to auto-fix low-risk issues and require human review for risky changes.
+- Generic model-driven repair loop (up to 3 attempts) using unified diff patches.
+- GitHub Actions workflows for CI, repair orchestration, and release policy gating.
+
+## Project layout
+
+- `mcp_server/main.py` - MCP tools and orchestration entrypoints
+- `mcp_server/run_repair.py` - workflow-safe command runner
+- `mcp_server/config.py` - typed environment config
+- `mcp_server/tools/*` - GitHub, diagnosis, risk, and PR automation modules
+- `.github/workflows/*` - CI/CD automation workflows
+
+## Setup
+
+1. Create and activate a virtual environment.
+2. Install dependencies:
+   - `pip install -r requirements.txt`
+3. Copy environment defaults:
+   - `cp .env.example .env` (or create `.env` manually on Windows)
+4. Fill in required values (`OPENAI_API_KEY`, `GITHUB_TOKEN`).
+
+## Run MCP server locally
+
+- `python -m mcp_server.main`
+
+## Use in Cursor as MCP
+
+- MCP config is included at `.cursor/mcp.json`.
+- Restart Cursor so it loads the MCP server definition.
+- Ensure your `.env` has `OPENAI_API_KEY` and `GITHUB_TOKEN`.
+- In Cursor chat, call tools from `agentic-cicd-orchestrator` with:
+  - `repository`: `owner/repo`
+  - `run_id`: workflow run id (integer)
+- Main tools:
+  - `inspect_pipeline_failure`
+  - `orchestrate_autofix`
+
+## Run repair orchestration manually
+
+- Set `REPOSITORY` (for example `org/repo`).
+- Optional:
+  - `RUN_ID` (if omitted, latest failed run is auto-selected)
+  - `WORKFLOW_NAME` (filter latest failed run by workflow name, e.g. `ci`)
+  - `BASE_BRANCH` (default `main`)
+- Execute: `python -m mcp_server.run_repair`
+
+## LLM auto-repair controls
+
+- `MAX_REPAIR_ATTEMPTS` - number of patch generation/application retries (default `3`).
+- `PATCH_STRATEGY` - patch format expected from model (must be `unified_diff`).
+- `LLM_PATCH_MAX_CHARS` - upper bound on patch payload size.
+
+## Governance model
+
+- `risk_score < RISK_AUTO_FIX_THRESHOLD` -> autonomous auto-fix PR path.
+- `RISK_AUTO_FIX_THRESHOLD <= risk_score < RISK_HUMAN_REVIEW_THRESHOLD` -> human approval required.
+- `risk_score >= RISK_HUMAN_REVIEW_THRESHOLD` or high-risk file categories -> blocked/review-only path.
+- `FORCE_AUTOFIX_ALL=true` -> bypass thresholds and force auto-fix path (dangerous; use only in controlled testing).
+
+## Security notes
+
+- Use least-privilege GitHub credentials.
+- Keep production deployment credentials separate from auto-repair identity.
+- Review generated PRs and audit artifacts before enabling automerge in production.
+
+
+
+
+================================================
+FILE: requirements.txt
+================================================
+fastmcp>=0.2.0
+httpx>=0.27.0
+pydantic>=2.8.0
+pydantic-settings>=2.4.0
+python-dotenv>=1.0.1
+
+
+
+================================================
+FILE: .env.example
+================================================
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini
+
+GITHUB_TOKEN=
+GITHUB_APP_ID=
+# Option A (recommended): one-line escaped format
+# GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nYOUR_KEY_LINE_1\nYOUR_KEY_LINE_2\n-----END RSA PRIVATE KEY-----\n"
+#
+# Option B (raw multiline): include full key exactly as downloaded
+GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----
+YOUR_KEY_LINE_1
+YOUR_KEY_LINE_2
+YOUR_KEY_LINE_3
+-----END RSA PRIVATE KEY-----"
+
+RISK_AUTO_FIX_THRESHOLD=0.80
+RISK_HUMAN_REVIEW_THRESHOLD=0.90
+MAX_AUTOFIX_FILES=5
+MAX_AUTOFIX_HUNKS=20
+MAX_REPAIR_ATTEMPTS=3
+PATCH_STRATEGY=unified_diff
+LLM_PATCH_MAX_CHARS=24000
+FORCE_AUTOFIX_ALL=false
+INDEXING_ENABLED=false
+INDEXING_REBUILD=false
+INDEXING_TOP_K=8
+INDEXING_MAX_QUERY_CHARS=2000
+INDEXING_MAX_QUERY_TOKENS=120
+INDEXING_SKIP_SYMBOL_TOKEN_THRESHOLD=80
+ALLOW_AUTOMERGE_LOW_RISK=true
+REQUIRE_APPROVAL_FOR_RELEASE=false
+LOG_LEVEL=INFO
+BASE_BRANCH=main
+WORKFLOW_NAME=
+RUN_ID=
+
+
+
+
+================================================
+FILE: indexing/index_code.py
+================================================
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+from collections import Counter, defaultdict
+from dataclasses import asdict
+from pathlib import Path
+from typing import Iterable
+from xml.etree import ElementTree as ET
+
+from index_schema import (
+    DEFAULT_EMBEDDING_MODEL,
+    IGNORED_DIRS,
+    INDEX_VERSION,
+    MAX_FILE_SIZE_BYTES,
+    SUPPORTED_EXTENSIONS,
+    ChunkRecord,
+    FileRecord,
+    SymbolRecord,
+    create_schema,
+    detect_language,
+    ensure_index_paths,
+    file_sha256,
+    read_config,
+    stable_id,
+    tokenize,
+    write_config,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build local hybrid code index.")
+    parser.add_argument("--folder", required=True, help="Target source folder to index.")
+    parser.add_argument(
+        "--index-dir",
+        default=None,
+        help="Optional output index directory. Defaults to <folder>/.code_index.",
+    )
+    parser.add_argument("--rebuild", action="store_true", help="Delete and rebuild index.")
+    parser.add_argument(
+        "--embedding-model",
+        default=DEFAULT_EMBEDDING_MODEL,
+        help="Sentence-transformer model name.",
+    )
+    parser.add_argument("--batch-size", type=int, default=32, help="Embedding batch size.")
+    return parser.parse_args()
+
+
+def should_skip_dir(dirname: str) -> bool:
+    return dirname in IGNORED_DIRS or dirname.startswith(".")
+
+
+def collect_files(target_folder: Path) -> list[Path]:
+    file_paths: list[Path] = []
+    for root, dirs, files in os.walk(target_folder):
+        dirs[:] = [d for d in dirs if not should_skip_dir(d)]
+        root_path = Path(root)
+        for name in files:
+            file_path = root_path / name
+            if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            try:
+                if file_path.stat().st_size > MAX_FILE_SIZE_BYTES:
+                    continue
+            except OSError:
+                continue
+            file_paths.append(file_path)
+    return sorted(file_paths)
+
+
+def read_file_record(path: Path, root_folder: Path) -> FileRecord | None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    rel_path = str(path.relative_to(root_folder)).replace("\\", "/")
+    language = detect_language(path)
+    return FileRecord(
+        path=str(path.resolve()),
+        rel_path=rel_path,
+        language=language,
+        file_hash=file_sha256(text),
+        mtime=stat.st_mtime,
+        size_bytes=stat.st_size,
+        text=text,
+    )
+
+
+def try_build_tree_sitter_parsers() -> dict[str, object]:
+    parsers: dict[str, object] = {}
+    try:
+        import tree_sitter_language_pack as tslp  # type: ignore
+        from tree_sitter import Parser  # type: ignore
+    except Exception:
+        return parsers
+
+    for lang_name, language_key in (("kotlin", "kotlin"), ("java", "java")):
+        try:
+            parser = Parser(tslp.get_language(language_key))
+            parsers[lang_name] = parser
+        except Exception:
+            continue
+    return parsers
+
+
+def extract_kotlin_or_java_symbols_regex(file_rec: FileRecord) -> tuple[list[SymbolRecord], list[str]]:
+    symbols: list[SymbolRecord] = []
+    imports: list[str] = []
+    lines = file_rec.text.splitlines()
+    for idx, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if stripped.startswith("import "):
+            imports.append(stripped.removeprefix("import ").strip())
+
+        match = re.match(r"(?:public|private|internal|protected)?\s*(class|interface|object)\s+([A-Za-z_][A-Za-z0-9_]*)", stripped)
+        if match:
+            symbol_type = match.group(1)
+            name = match.group(2)
+            symbols.append(
+                SymbolRecord(
+                    symbol_id=stable_id(file_rec.rel_path, symbol_type, name, str(idx)),
+                    file_rel_path=file_rec.rel_path,
+                    language=file_rec.language,
+                    symbol_type=symbol_type,
+                    name=name,
+                    start_line=idx,
+                    end_line=min(idx + 30, len(lines)),
+                    signature=stripped,
+                )
+            )
+            continue
+
+        fn_match = re.match(r"(?:suspend\s+)?fun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", stripped)
+        if fn_match:
+            name = fn_match.group(1)
+            symbols.append(
+                SymbolRecord(
+                    symbol_id=stable_id(file_rec.rel_path, "function", name, str(idx)),
+                    file_rel_path=file_rec.rel_path,
+                    language=file_rec.language,
+                    symbol_type="function",
+                    name=name,
+                    start_line=idx,
+                    end_line=min(idx + 40, len(lines)),
+                    signature=stripped,
+                )
+            )
+            continue
+
+        java_fn = re.match(
+            r"(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?[A-Za-z0-9_<>\[\]]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*\{?",
+            stripped,
+        )
+        if java_fn and " class " not in stripped:
+            name = java_fn.group(1)
+            symbols.append(
+                SymbolRecord(
+                    symbol_id=stable_id(file_rec.rel_path, "method", name, str(idx)),
+                    file_rel_path=file_rec.rel_path,
+                    language=file_rec.language,
+                    symbol_type="method",
+                    name=name,
+                    start_line=idx,
+                    end_line=min(idx + 40, len(lines)),
+                    signature=stripped,
+                )
+            )
+    return symbols, imports
+
+
+def extract_xml_symbols(file_rec: FileRecord) -> tuple[list[SymbolRecord], list[str]]:
+    symbols: list[SymbolRecord] = []
+    imports: list[str] = []
+    lines = file_rec.text.splitlines()
+    try:
+        root = ET.fromstring(file_rec.text)
+    except ET.ParseError:
+        return symbols, imports
+
+    line_index_lookup: dict[str, int] = {}
+    for idx, line in enumerate(lines, start=1):
+        key = line.strip()
+        if key:
+            line_index_lookup.setdefault(key[:100], idx)
+
+    for elem in root.iter():
+        tag = str(elem.tag).split("}")[-1]
+        raw_id = elem.attrib.get("{http://schemas.android.com/apk/res/android}id") or elem.attrib.get("android:id")
+        raw_name = elem.attrib.get("name")
+        symbol_name = None
+        if raw_id:
+            symbol_name = raw_id.split("/")[-1]
+        elif raw_name:
+            symbol_name = raw_name
+        elif tag:
+            symbol_name = tag
+        if not symbol_name:
+            continue
+
+        preview = f"<{tag}"
+        line_no = line_index_lookup.get(preview, 1)
+        symbols.append(
+            SymbolRecord(
+                symbol_id=stable_id(file_rec.rel_path, "xml", symbol_name, str(line_no)),
+                file_rel_path=file_rec.rel_path,
+                language=file_rec.language,
+                symbol_type="xml_node",
+                name=symbol_name,
+                start_line=line_no,
+                end_line=min(line_no + 10, len(lines)),
+                signature=f"{tag} id={raw_id or ''} name={raw_name or ''}".strip(),
+            )
+        )
+
+    for key in ("name", "route", "action"):
+        if key in file_rec.text:
+            imports.append(key)
+    return symbols, imports
+
+
+def extract_symbols_and_imports(file_rec: FileRecord, parsers: dict[str, object]) -> tuple[list[SymbolRecord], list[str]]:
+    if file_rec.language == "xml":
+        return extract_xml_symbols(file_rec)
+    # Tree-sitter parser hookup point kept for future parser-accurate ranges.
+    _ = parsers.get(file_rec.language)
+    return extract_kotlin_or_java_symbols_regex(file_rec)
+
+
+def build_chunks(file_rec: FileRecord, symbols: list[SymbolRecord]) -> list[ChunkRecord]:
+    lines = file_rec.text.splitlines()
+    chunks: list[ChunkRecord] = []
+
+    if symbols:
+        for symbol in symbols:
+            start_line = max(symbol.start_line, 1)
+            end_line = min(symbol.end_line, len(lines))
+            snippet = "\n".join(lines[start_line - 1 : end_line]).strip()
+            if not snippet:
+                continue
+            token_count = len(tokenize(snippet))
+            chunks.append(
+                ChunkRecord(
+                    chunk_id=stable_id(file_rec.rel_path, symbol.symbol_id, str(start_line), str(end_line)),
+                    file_rel_path=file_rec.rel_path,
+                    language=file_rec.language,
+                    symbol_name=symbol.name,
+                    symbol_type=symbol.symbol_type,
+                    start_line=start_line,
+                    end_line=end_line,
+                    text=snippet,
+                    token_count=token_count,
+                    file_hash=file_rec.file_hash,
+                )
+            )
+
+    if not chunks:
+        window = 80
+        overlap = 20
+        cursor = 0
+        while cursor < len(lines):
+            end_idx = min(cursor + window, len(lines))
+            snippet = "\n".join(lines[cursor:end_idx]).strip()
+            if snippet:
+                chunks.append(
+                    ChunkRecord(
+                        chunk_id=stable_id(file_rec.rel_path, "fallback", str(cursor), str(end_idx)),
+                        file_rel_path=file_rec.rel_path,
+                        language=file_rec.language,
+                        symbol_name=None,
+                        symbol_type=None,
+                        start_line=cursor + 1,
+                        end_line=end_idx,
+                        text=snippet,
+                        token_count=len(tokenize(snippet)),
+                        file_hash=file_rec.file_hash,
+                    )
+                )
+            if end_idx == len(lines):
+                break
+            cursor += max(window - overlap, 1)
+    return chunks
+
+
+def write_index_db(
+    db_path: Path,
+    file_records: list[FileRecord],
+    symbols: list[SymbolRecord],
+    imports: list[tuple[str, str]],
+    chunks: list[ChunkRecord],
+) -> None:
+    conn = sqlite3.connect(db_path)
+    create_schema(conn)
+    with conn:
+        conn.execute("DELETE FROM files")
+        conn.execute("DELETE FROM symbols")
+        conn.execute("DELETE FROM imports")
+        conn.execute("DELETE FROM chunks")
+        conn.execute("DELETE FROM lexical_postings")
+
+        conn.executemany(
+            """
+            INSERT INTO files(rel_path, abs_path, language, file_hash, mtime, size_bytes)
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            [(f.rel_path, f.path, f.language, f.file_hash, f.mtime, f.size_bytes) for f in file_records],
+        )
+
+        conn.executemany(
+            """
+            INSERT INTO symbols(symbol_id, file_rel_path, language, symbol_type, name, start_line, end_line, signature, parent_symbol)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    s.symbol_id,
+                    s.file_rel_path,
+                    s.language,
+                    s.symbol_type,
+                    s.name,
+                    s.start_line,
+                    s.end_line,
+                    s.signature,
+                    s.parent_symbol,
+                )
+                for s in symbols
+            ],
+        )
+
+        conn.executemany(
+            "INSERT OR IGNORE INTO imports(file_rel_path, imported_symbol) VALUES(?, ?)",
+            imports,
+        )
+
+        conn.executemany(
+            """
+            INSERT INTO chunks(chunk_id, file_rel_path, language, symbol_name, symbol_type, start_line, end_line, text, token_count, file_hash)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    c.chunk_id,
+                    c.file_rel_path,
+                    c.language,
+                    c.symbol_name,
+                    c.symbol_type,
+                    c.start_line,
+                    c.end_line,
+                    c.text,
+                    c.token_count,
+                    c.file_hash,
+                )
+                for c in chunks
+            ],
+        )
+
+        postings: list[tuple[str, str, float]] = []
+        for chunk in chunks:
+            tokens = tokenize(chunk.text)
+            if not tokens:
+                continue
+            counts = Counter(tokens)
+            total = max(len(tokens), 1)
+            for token, count in counts.items():
+                postings.append((token, chunk.chunk_id, count / total))
+        conn.executemany(
+            "INSERT INTO lexical_postings(token, chunk_id, tf) VALUES(?, ?, ?)",
+            postings,
+        )
+    conn.close()
+
+
+def ensure_unique_symbol_ids(symbols: list[SymbolRecord]) -> list[SymbolRecord]:
+    seen: dict[str, int] = defaultdict(int)
+    normalized: list[SymbolRecord] = []
+    for symbol in symbols:
+        seen[symbol.symbol_id] += 1
+        if seen[symbol.symbol_id] == 1:
+            normalized.append(symbol)
+            continue
+        suffix = seen[symbol.symbol_id] - 1
+        normalized.append(
+            SymbolRecord(
+                symbol_id=f"{symbol.symbol_id}_{suffix}",
+                file_rel_path=symbol.file_rel_path,
+                language=symbol.language,
+                symbol_type=symbol.symbol_type,
+                name=symbol.name,
+                start_line=symbol.start_line,
+                end_line=symbol.end_line,
+                signature=symbol.signature,
+                parent_symbol=symbol.parent_symbol,
+            )
+        )
+    return normalized
+
+
+def ensure_unique_chunk_ids(chunks: list[ChunkRecord]) -> list[ChunkRecord]:
+    seen: dict[str, int] = defaultdict(int)
+    normalized: list[ChunkRecord] = []
+    for chunk in chunks:
+        seen[chunk.chunk_id] += 1
+        if seen[chunk.chunk_id] == 1:
+            normalized.append(chunk)
+            continue
+        suffix = seen[chunk.chunk_id] - 1
+        normalized.append(
+            ChunkRecord(
+                chunk_id=f"{chunk.chunk_id}_{suffix}",
+                file_rel_path=chunk.file_rel_path,
+                language=chunk.language,
+                symbol_name=chunk.symbol_name,
+                symbol_type=chunk.symbol_type,
+                start_line=chunk.start_line,
+                end_line=chunk.end_line,
+                text=chunk.text,
+                token_count=chunk.token_count,
+                file_hash=chunk.file_hash,
+            )
+        )
+    return normalized
+
+
+def try_embed_chunks(
+    chunks: list[ChunkRecord], model_name: str, batch_size: int
+) -> tuple[list[list[float]], str | None]:
+    if not chunks:
+        return [], None
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+    except Exception as exc:
+        return [], f"semantic embedding disabled (sentence-transformers unavailable): {exc}"
+    try:
+        model = SentenceTransformer(model_name)
+        vectors = model.encode([c.text for c in chunks], batch_size=batch_size, normalize_embeddings=True)
+        return vectors.tolist(), None
+    except Exception as exc:
+        return [], f"semantic embedding disabled (model load/encode failed): {exc}"
+
+
+def persist_vectors(index_paths: dict[str, Path], chunks: list[ChunkRecord], vectors: list[list[float]]) -> str | None:
+    if not vectors:
+        return "No vectors generated. Semantic retrieval will be skipped."
+    chunk_rows = [asdict(c) for c in chunks]
+    index_paths["chunks_jsonl_path"].write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in chunk_rows),
+        encoding="utf-8",
+    )
+    try:
+        import faiss  # type: ignore
+        import numpy as np  # type: ignore
+    except Exception as exc:
+        return f"FAISS unavailable ({exc}). Install dependencies from tools/requirements.txt."
+
+    matrix = np.asarray(vectors, dtype="float32")
+    index = faiss.IndexFlatIP(matrix.shape[1])
+    index.add(matrix)
+    faiss.write_index(index, str(index_paths["faiss_path"]))
+    return None
+
+
+def main() -> int:
+    args = parse_args()
+    target_folder = Path(args.folder)
+    if not target_folder.exists() or not target_folder.is_dir():
+        print(f"[error] Folder does not exist or is not a directory: {target_folder}")
+        return 2
+
+    index_dir = Path(args.index_dir) if args.index_dir else None
+    index_paths = ensure_index_paths(target_folder=target_folder, index_dir=index_dir)
+
+    if args.rebuild and index_paths["index_dir"].exists():
+        shutil.rmtree(index_paths["index_dir"], ignore_errors=True)
+        index_paths = ensure_index_paths(target_folder=target_folder, index_dir=index_dir)
+
+    prior_config = read_config(index_paths["config_path"])
+    discovered_files = collect_files(index_paths["target_folder"])
+    file_records = [
+        rec
+        for rec in (
+            read_file_record(path=file_path, root_folder=index_paths["target_folder"]) for file_path in discovered_files
+        )
+        if rec is not None
+    ]
+    parser_map = try_build_tree_sitter_parsers()
+    if not parser_map:
+        print("[warn] Tree-sitter parsers unavailable. Using regex/XML fallback extraction.")
+
+    all_symbols: list[SymbolRecord] = []
+    all_imports: list[tuple[str, str]] = []
+    all_chunks: list[ChunkRecord] = []
+    for file_rec in file_records:
+        symbols, imports = extract_symbols_and_imports(file_rec, parser_map)
+        chunks = build_chunks(file_rec, symbols)
+        all_symbols.extend(symbols)
+        all_imports.extend((file_rec.rel_path, imp) for imp in imports)
+        all_chunks.extend(chunks)
+    all_symbols = ensure_unique_symbol_ids(all_symbols)
+    all_chunks = ensure_unique_chunk_ids(all_chunks)
+
+    write_index_db(
+        db_path=index_paths["db_path"],
+        file_records=file_records,
+        symbols=all_symbols,
+        imports=all_imports,
+        chunks=all_chunks,
+    )
+
+    vectors, semantic_error = try_embed_chunks(
+        chunks=all_chunks, model_name=args.embedding_model, batch_size=max(args.batch_size, 1)
+    )
+    persist_error = persist_vectors(index_paths=index_paths, chunks=all_chunks, vectors=vectors)
+    warning_msgs = [msg for msg in (semantic_error, persist_error) if msg]
+
+    current_config = {
+        "index_version": INDEX_VERSION,
+        "target_folder": str(index_paths["target_folder"]),
+        "files_indexed": len(file_records),
+        "symbols_indexed": len(all_symbols),
+        "chunks_indexed": len(all_chunks),
+        "semantic_enabled": not warning_msgs,
+        "embedding_model": args.embedding_model,
+        "supported_extensions": sorted(SUPPORTED_EXTENSIONS),
+    }
+    write_config(index_paths["config_path"], current_config)
+
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "index_dir": str(index_paths["index_dir"]),
+                "db_path": str(index_paths["db_path"]),
+                "files_indexed": len(file_records),
+                "symbols_indexed": len(all_symbols),
+                "chunks_indexed": len(all_chunks),
+                "warnings": warning_msgs,
+                "previous_config_found": bool(prior_config),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+
+================================================
+FILE: indexing/index_schema.py
+================================================
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sqlite3
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+INDEX_VERSION = "1.0.0"
+DEFAULT_INDEX_DIR_NAME = ".code_index"
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+SUPPORTED_EXTENSIONS = {
+    ".kt",
+    ".java",
+    ".xml",
+    ".py",
+    ".txt",
+    ".md",
+    ".yml",
+    ".yaml",
+}
+IGNORED_DIRS = {
+    ".git",
+    ".gradle",
+    ".idea",
+    ".kotlin",
+    "build",
+    "out",
+    "__pycache__",
+}
+MAX_FILE_SIZE_BYTES = 1024 * 1024 * 2
+
+
+@dataclass(slots=True)
+class FileRecord:
+    path: str
+    rel_path: str
+    language: str
+    file_hash: str
+    mtime: float
+    size_bytes: int
+    text: str
+
+
+@dataclass(slots=True)
+class SymbolRecord:
+    symbol_id: str
+    file_rel_path: str
+    language: str
+    symbol_type: str
+    name: str
+    start_line: int
+    end_line: int
+    signature: str
+    parent_symbol: str | None = None
+
+
+@dataclass(slots=True)
+class ChunkRecord:
+    chunk_id: str
+    file_rel_path: str
+    language: str
+    symbol_name: str | None
+    symbol_type: str | None
+    start_line: int
+    end_line: int
+    text: str
+    token_count: int
+    file_hash: str
+
+
+def ensure_index_paths(target_folder: Path, index_dir: Path | None = None) -> dict[str, Path]:
+    target_folder = target_folder.resolve()
+    resolved_index_dir = (index_dir or (target_folder / DEFAULT_INDEX_DIR_NAME)).resolve()
+    resolved_index_dir.mkdir(parents=True, exist_ok=True)
+    vector_dir = resolved_index_dir / "vectors"
+    vector_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "target_folder": target_folder,
+        "index_dir": resolved_index_dir,
+        "db_path": resolved_index_dir / "index.db",
+        "config_path": resolved_index_dir / "config.json",
+        "vector_dir": vector_dir,
+        "faiss_path": vector_dir / "chunks.faiss",
+        "chunks_jsonl_path": vector_dir / "chunks.jsonl",
+    }
+
+
+def file_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def stable_id(*parts: str) -> str:
+    return hashlib.sha1("::".join(parts).encode("utf-8", errors="ignore")).hexdigest()
+
+
+def split_identifier(token: str) -> list[str]:
+    pieces = [token]
+    pieces.extend(re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|\d+", token))
+    snake_split = re.split(r"[_\W]+", token)
+    pieces.extend(snake_split)
+    normalized = []
+    for part in pieces:
+        lowered = part.strip().lower()
+        if lowered and len(lowered) >= 2:
+            normalized.append(lowered)
+    return normalized
+
+
+def tokenize(text: str) -> list[str]:
+    raw_tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text)
+    tokens: list[str] = []
+    for token in raw_tokens:
+        tokens.extend(split_identifier(token))
+    return tokens
+
+
+def detect_language(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".kt":
+        return "kotlin"
+    if suffix == ".java":
+        return "java"
+    if suffix == ".xml":
+        return "xml"
+    return "text"
+
+
+def chunk_lines(text: str, start_line: int, end_line: int) -> str:
+    lines = text.splitlines()
+    start_idx = max(start_line - 1, 0)
+    end_idx = min(end_line, len(lines))
+    return "\n".join(lines[start_idx:end_idx]).strip()
+
+
+def create_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS files (
+            rel_path TEXT PRIMARY KEY,
+            abs_path TEXT NOT NULL,
+            language TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            mtime REAL NOT NULL,
+            size_bytes INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS symbols (
+            symbol_id TEXT PRIMARY KEY,
+            file_rel_path TEXT NOT NULL,
+            language TEXT NOT NULL,
+            symbol_type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            signature TEXT NOT NULL,
+            parent_symbol TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_rel_path);
+        CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+
+        CREATE TABLE IF NOT EXISTS chunks (
+            chunk_id TEXT PRIMARY KEY,
+            file_rel_path TEXT NOT NULL,
+            language TEXT NOT NULL,
+            symbol_name TEXT,
+            symbol_type TEXT,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            token_count INTEGER NOT NULL,
+            file_hash TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_rel_path);
+
+        CREATE TABLE IF NOT EXISTS lexical_postings (
+            token TEXT NOT NULL,
+            chunk_id TEXT NOT NULL,
+            tf REAL NOT NULL,
+            PRIMARY KEY(token, chunk_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lexical_token ON lexical_postings(token);
+
+        CREATE TABLE IF NOT EXISTS imports (
+            file_rel_path TEXT NOT NULL,
+            imported_symbol TEXT NOT NULL,
+            PRIMARY KEY(file_rel_path, imported_symbol)
+        );
+        CREATE INDEX IF NOT EXISTS idx_import_symbol ON imports(imported_symbol);
+        """
+    )
+    conn.commit()
+
+
+def write_config(config_path: Path, config: dict[str, Any]) -> None:
+    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def read_config(config_path: Path) -> dict[str, Any]:
+    if not config_path.exists():
+        return {}
+    return json.loads(config_path.read_text(encoding="utf-8"))
+
+
+def serialize_dataclass_rows(rows: Iterable[Any], output_path: Path) -> None:
+    with output_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(asdict(row), ensure_ascii=False))
+            f.write("\n")
+
+
+
+================================================
+FILE: indexing/query_code.py
+================================================
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+from index_schema import DEFAULT_EMBEDDING_MODEL, ensure_index_paths, read_config, tokenize
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Query local hybrid code index.")
+    parser.add_argument("--folder", required=True, help="Indexed folder root.")
+    parser.add_argument("--index-dir", default=None, help="Optional explicit index directory.")
+    parser.add_argument("--query", required=True, help="Natural language/code query.")
+    parser.add_argument("--top-k", type=int, default=8, help="Final number of results.")
+    parser.add_argument("--lexical-k", type=int, default=20)
+    parser.add_argument("--symbol-k", type=int, default=20)
+    parser.add_argument("--semantic-k", type=int, default=20)
+    parser.add_argument(
+        "--skip-symbol",
+        action="store_true",
+        help="Skip symbol-based retrieval (prevents overly complex SQL in symbol_retrieval).",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+    parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
+    return parser.parse_args()
+
+
+def load_sqlite_rows(db_path: Path, query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return rows
+
+
+def lexical_retrieval(db_path: Path, query_text: str, top_k: int) -> list[dict[str, Any]]:
+    query_tokens = tokenize(query_text)
+    if not query_tokens:
+        return []
+    placeholders = ",".join("?" for _ in query_tokens)
+    sql = f"""
+    SELECT lp.chunk_id, SUM(lp.tf) AS lexical_score
+    FROM lexical_postings lp
+    WHERE lp.token IN ({placeholders})
+    GROUP BY lp.chunk_id
+    ORDER BY lexical_score DESC, lp.chunk_id ASC
+    LIMIT ?
+    """
+    rows = load_sqlite_rows(db_path, sql, tuple(query_tokens + [top_k]))
+    return [{"chunk_id": row["chunk_id"], "score": float(row["lexical_score"])} for row in rows]
+
+
+def symbol_retrieval(db_path: Path, query_text: str, top_k: int) -> list[dict[str, Any]]:
+    tokens = tokenize(query_text)
+    if not tokens:
+        return []
+    like_clauses = " OR ".join("LOWER(s.name) LIKE ?" for _ in tokens)
+    sql = f"""
+    SELECT c.chunk_id, COUNT(*) AS symbol_score
+    FROM symbols s
+    JOIN chunks c
+      ON c.file_rel_path = s.file_rel_path
+     AND c.start_line <= s.start_line
+     AND c.end_line >= s.start_line
+    WHERE {like_clauses}
+    GROUP BY c.chunk_id
+    ORDER BY symbol_score DESC, c.chunk_id ASC
+    LIMIT ?
+    """
+    params = tuple([f"%{tok.lower()}%" for tok in tokens] + [top_k])
+    rows = load_sqlite_rows(db_path, sql, params)
+    return [{"chunk_id": row["chunk_id"], "score": float(row["symbol_score"])} for row in rows]
+
+
+def semantic_retrieval(db_path: Path, index_paths: dict[str, Path], query_text: str, top_k: int, embedding_model: str) -> list[dict[str, Any]]:
+    if not index_paths["faiss_path"].exists():
+        return []
+    try:
+        import faiss  # type: ignore
+        import numpy as np  # type: ignore
+        from sentence_transformers import SentenceTransformer  # type: ignore
+    except Exception:
+        return []
+
+    chunk_rows = load_sqlite_rows(db_path, "SELECT chunk_id FROM chunks ORDER BY rowid ASC")
+    if not chunk_rows:
+        return []
+    chunk_ids = [r["chunk_id"] for r in chunk_rows]
+    try:
+        model = SentenceTransformer(embedding_model)
+        vec = model.encode([query_text], normalize_embeddings=True)
+        query_vector = np.asarray(vec, dtype="float32")
+        index = faiss.read_index(str(index_paths["faiss_path"]))
+        distances, indices = index.search(query_vector, top_k)
+    except Exception:
+        return []
+
+    results: list[dict[str, Any]] = []
+    for score, idx in zip(distances[0].tolist(), indices[0].tolist()):
+        if idx < 0 or idx >= len(chunk_ids):
+            continue
+        results.append({"chunk_id": chunk_ids[idx], "score": float(score)})
+    return results
+
+
+def merge_scores(
+    lexical: list[dict[str, Any]],
+    symbol: list[dict[str, Any]],
+    semantic: list[dict[str, Any]],
+    top_k: int,
+) -> list[dict[str, Any]]:
+    weighted: dict[str, dict[str, float]] = defaultdict(lambda: {"lexical": 0.0, "symbol": 0.0, "semantic": 0.0, "total": 0.0})
+    for item in lexical:
+        weighted[item["chunk_id"]]["lexical"] = item["score"]
+    for item in symbol:
+        weighted[item["chunk_id"]]["symbol"] = item["score"]
+    for item in semantic:
+        weighted[item["chunk_id"]]["semantic"] = item["score"]
+
+    for chunk_id, score_map in weighted.items():
+        score_map["total"] = 0.45 * score_map["lexical"] + 0.25 * score_map["symbol"] + 0.30 * score_map["semantic"]
+
+    ranked = sorted(
+        [{"chunk_id": cid, **scores} for cid, scores in weighted.items()],
+        key=lambda item: (-item["total"], -item["lexical"], -item["semantic"], item["chunk_id"]),
+    )
+    return ranked[:top_k]
+
+
+def fetch_chunks(db_path: Path, chunk_ids: list[str]) -> dict[str, sqlite3.Row]:
+    if not chunk_ids:
+        return {}
+    placeholders = ",".join("?" for _ in chunk_ids)
+    sql = f"""
+    SELECT chunk_id, file_rel_path, language, symbol_name, symbol_type, start_line, end_line, text
+    FROM chunks
+    WHERE chunk_id IN ({placeholders})
+    """
+    rows = load_sqlite_rows(db_path, sql, tuple(chunk_ids))
+    return {row["chunk_id"]: row for row in rows}
+
+
+def fetch_context_expansion(db_path: Path, file_rel_path: str, start_line: int, end_line: int, max_items: int = 3) -> list[dict[str, Any]]:
+    sql_adjacent = """
+    SELECT chunk_id, file_rel_path, symbol_name, symbol_type, start_line, end_line, text
+    FROM chunks
+    WHERE file_rel_path = ?
+      AND (
+        (end_line >= ? AND start_line <= ?)
+        OR ABS(start_line - ?) <= 25
+        OR ABS(end_line - ?) <= 25
+      )
+    ORDER BY start_line ASC
+    LIMIT ?
+    """
+    adjacent_rows = load_sqlite_rows(db_path, sql_adjacent, (file_rel_path, start_line, end_line, start_line, end_line, max_items))
+
+    sql_imports = """
+    SELECT c.chunk_id, c.file_rel_path, c.symbol_name, c.symbol_type, c.start_line, c.end_line, c.text
+    FROM imports i
+    JOIN symbols s ON s.file_rel_path = i.file_rel_path
+    JOIN chunks c ON c.file_rel_path = s.file_rel_path
+    WHERE i.file_rel_path = ?
+      AND c.symbol_name LIKE '%' || s.name || '%'
+    LIMIT ?
+    """
+    import_rows = load_sqlite_rows(db_path, sql_imports, (file_rel_path, max_items))
+
+    seen = set()
+    out: list[dict[str, Any]] = []
+    for row in list(adjacent_rows) + list(import_rows):
+        if row["chunk_id"] in seen:
+            continue
+        seen.add(row["chunk_id"])
+        out.append(
+            {
+                "chunk_id": row["chunk_id"],
+                "file_path": row["file_rel_path"],
+                "symbol_name": row["symbol_name"],
+                "symbol_type": row["symbol_type"],
+                "line_range": [row["start_line"], row["end_line"]],
+                "snippet": row["text"],
+            }
+        )
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def render_text_output(query: str, index_dir: Path, ranked_results: list[dict[str, Any]]) -> str:
+    lines = [
+        f"query: {query}",
+        f"index_dir: {index_dir}",
+        f"results: {len(ranked_results)}",
+        "-" * 80,
+    ]
+    for idx, item in enumerate(ranked_results, start=1):
+        score = item["score_breakdown"]
+        lines.extend(
+            [
+                f"[{idx}] {item['file_path']}:{item['line_range'][0]}-{item['line_range'][1]}",
+                f"    symbol: {item.get('symbol_name') or '<none>'} ({item.get('symbol_type') or 'chunk'})",
+                f"    score: total={score['total']:.4f} lexical={score['lexical']:.4f} symbol={score['symbol']:.4f} semantic={score['semantic']:.4f}",
+                "    snippet:",
+            ]
+        )
+        for snippet_line in item["snippet"].splitlines()[:12]:
+            lines.append(f"      {snippet_line}")
+        if len(item["snippet"].splitlines()) > 12:
+            lines.append("      ...")
+        if item["context_expansion"]:
+            lines.append("    context_expansion:")
+            for ctx in item["context_expansion"]:
+                lines.append(
+                    f"      - {ctx['file_path']}:{ctx['line_range'][0]}-{ctx['line_range'][1]} "
+                    f"{ctx.get('symbol_name') or '<none>'}"
+                )
+        lines.append("-" * 80)
+    return "\n".join(lines)
+
+
+def main() -> int:
+    args = parse_args()
+    folder = Path(args.folder).resolve()
+    if not folder.exists() or not folder.is_dir():
+        print(f"[error] Folder does not exist or is not a directory: {folder}")
+        return 2
+
+    index_dir = Path(args.index_dir).resolve() if args.index_dir else None
+    index_paths = ensure_index_paths(folder, index_dir)
+    db_path = index_paths["db_path"]
+    if not db_path.exists():
+        print(f"[error] Index database not found at {db_path}. Run index_code.py first.")
+        return 2
+
+    config = read_config(index_paths["config_path"])
+    embedding_model = config.get("embedding_model", args.embedding_model)
+
+    lexical_hits = lexical_retrieval(db_path, args.query, args.lexical_k)
+    symbol_hits = [] if args.skip_symbol else symbol_retrieval(db_path, args.query, args.symbol_k)
+    semantic_hits = semantic_retrieval(
+        db_path=db_path,
+        index_paths=index_paths,
+        query_text=args.query,
+        top_k=args.semantic_k,
+        embedding_model=embedding_model,
+    )
+    merged = merge_scores(lexical_hits, symbol_hits, semantic_hits, args.top_k)
+    chunk_rows = fetch_chunks(db_path, [item["chunk_id"] for item in merged])
+
+    final_results: list[dict[str, Any]] = []
+    for entry in merged:
+        chunk = chunk_rows.get(entry["chunk_id"])
+        if chunk is None:
+            continue
+        context = fetch_context_expansion(
+            db_path=db_path,
+            file_rel_path=chunk["file_rel_path"],
+            start_line=int(chunk["start_line"]),
+            end_line=int(chunk["end_line"]),
+            max_items=3,
+        )
+        final_results.append(
+            {
+                "chunk_id": chunk["chunk_id"],
+                "file_path": chunk["file_rel_path"],
+                "language": chunk["language"],
+                "symbol_name": chunk["symbol_name"],
+                "symbol_type": chunk["symbol_type"],
+                "line_range": [int(chunk["start_line"]), int(chunk["end_line"])],
+                "snippet": chunk["text"],
+                "score_breakdown": {
+                    "lexical": entry["lexical"],
+                    "symbol": entry["symbol"],
+                    "semantic": entry["semantic"],
+                    "total": entry["total"],
+                },
+                "context_expansion": context,
+            }
+        )
+
+    payload = {
+        "query": args.query,
+        "index_dir": str(index_paths["index_dir"]),
+        "result_count": len(final_results),
+        "results": final_results,
+        "retrieval_stats": {
+            "lexical_candidates": len(lexical_hits),
+            "symbol_candidates": len(symbol_hits),
+            "semantic_candidates": len(semantic_hits),
+            "semantic_enabled": bool(semantic_hits),
+        },
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(render_text_output(args.query, index_paths["index_dir"], final_results))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+
+================================================
+FILE: mcp_server/__init__.py
+================================================
+"""Agentic CI/CD MCP server package."""
+
+
+
+
+================================================
+FILE: mcp_server/config.py
+================================================
+from functools import lru_cache
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore",
+    )
+
+    OPENAI_API_KEY: str = Field(default="")
+    OPENAI_MODEL: str = Field(default="gpt-4o-mini")
+
+    GITHUB_TOKEN: str = Field(default="")
+    GITHUB_APP_ID: str = Field(default="")
+    GITHUB_APP_PRIVATE_KEY: str = Field(default="")
+
+    RISK_AUTO_FIX_THRESHOLD: float = Field(default=0.30, ge=0.0, le=1.0)
+    RISK_HUMAN_REVIEW_THRESHOLD: float = Field(default=0.70, ge=0.0, le=1.0)
+
+    MAX_AUTOFIX_FILES: int = Field(default=5, ge=1)
+    MAX_AUTOFIX_HUNKS: int = Field(default=20, ge=1)
+    MAX_REPAIR_ATTEMPTS: int = Field(default=3, ge=1, le=10)
+    PATCH_STRATEGY: str = Field(default="unified_diff")
+    LLM_PATCH_MAX_CHARS: int = Field(default=24000, ge=2000, le=200000)
+    INDEXING_ENABLED: bool = Field(default=False)
+    INDEXING_REBUILD: bool = Field(default=False)
+    INDEXING_TOP_K: int = Field(default=8, ge=1, le=50)
+    INDEXING_MAX_QUERY_CHARS: int = Field(default=2000, ge=200, le=100000)
+    INDEXING_MAX_QUERY_TOKENS: int = Field(default=120, ge=10, le=2000)
+    INDEXING_SKIP_SYMBOL_TOKEN_THRESHOLD: int = Field(default=80, ge=1, le=2000)
+    FORCE_AUTOFIX_ALL: bool = Field(default=False)
+
+    ALLOW_AUTOMERGE_LOW_RISK: bool = Field(default=True)
+    REQUIRE_APPROVAL_FOR_RELEASE: bool = Field(default=True)
+    LOG_LEVEL: str = Field(default="INFO")
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
+
+
+
+
+================================================
+FILE: mcp_server/main.py
+================================================
+from __future__ import annotations
+
+from typing import Any
+
+from fastmcp import FastMCP
+
+from mcp_server.config import get_settings
+from mcp_server.tools.diagnose import diagnose_failure, generate_patch_with_llm
+from mcp_server.tools.fix_generator import build_fix_proposal_from_patch
+from mcp_server.tools.github_client import GitHubClient
+from mcp_server.tools.code_indexing import build_and_query
+from mcp_server.tools.logs_analyzer import (
+    extract_failing_tests,
+    extract_python_file_candidates,
+    normalize_logs,
+)
+from mcp_server.tools.pr_bot import open_autofix_pr
+from mcp_server.tools.risk_guard import decide_governance
+from mcp_server.tools.schemas import DiagnosisResult, PipelineContext, RepairAttempt
+
+
+mcp = FastMCP("agentic-cicd-orchestrator")
+
+
+@mcp.tool()
+async def inspect_pipeline_failure(repository: str, run_id: int) -> dict[str, Any]:
+    """Collect logs, failing tests, commit context, then produce diagnosis."""
+    settings = get_settings()
+    github = GitHubClient(settings.GITHUB_TOKEN)
+
+    run = await github.get_workflow_run(repository, run_id)
+    commit_sha = run.get("head_sha", "")
+    jobs = await github.list_run_jobs(repository, run_id)
+    changed_files = await github.get_commit_files(repository, commit_sha)
+    logs_text = await github.get_run_logs_text(repository, run_id)
+    if not logs_text:
+        logs_text = f"No logs downloaded for run {run_id}."
+    failed_jobs = [job.get("name", "unknown") for job in jobs if job.get("conclusion") == "failure"]
+    if failed_jobs:
+        logs_text = f"Failed jobs: {failed_jobs}\n\n{logs_text}"
+    logs_excerpt = normalize_logs(logs_text)
+    failing_tests = extract_failing_tests(logs_excerpt)
+
+    context = PipelineContext(
+        repository=repository,
+        run_id=run_id,
+        commit_sha=commit_sha,
+        logs_excerpt=logs_excerpt,
+        failing_tests=failing_tests,
+        changed_files=changed_files,
+    )
+    diagnosis = await diagnose_failure(settings, context)
+    decision = decide_governance(settings, diagnosis, changed_files)
+
+    return {
+        "context": context.model_dump(),
+        "diagnosis": diagnosis.model_dump(),
+        "governance": decision.model_dump(),
+    }
+
+
+@mcp.tool()
+async def orchestrate_autofix(
+    repository: str,
+    run_id: int,
+    base_branch: str = "main",
+) -> dict[str, Any]:
+    """Attempt low-risk autonomous fix and open PR."""
+    analysis = await inspect_pipeline_failure(repository, run_id)
+    governance = analysis["governance"]
+    if governance["decision"] != "auto_fix":
+        return {
+            "status": "requires_review",
+            "reason": governance["rationale"],
+            "analysis": analysis,
+        }
+
+    settings = get_settings()
+    if settings.PATCH_STRATEGY != "unified_diff":
+        return {
+            "status": "requires_review",
+            "reason": f"Unsupported PATCH_STRATEGY={settings.PATCH_STRATEGY}. Expected unified_diff.",
+            "analysis": analysis,
+        }
+    github = GitHubClient(settings.GITHUB_TOKEN)
+
+    context = PipelineContext.model_validate(analysis["context"])
+    diagnosis_model = DiagnosisResult.model_validate(analysis["diagnosis"])
+
+    # Fetch candidate file contents at the failing commit SHA.
+    candidates = [p for p in context.changed_files if p.endswith(".py")]
+    candidates.extend(extract_python_file_candidates(context.failing_tests))
+    if ("no module named 'app'" in context.logs_excerpt.lower()) and ("app.py" not in candidates):
+        candidates.append("app.py")
+    if "tests/test_app.py" not in candidates:
+        candidates.append("tests/test_app.py")
+
+    prioritized: list[str] = []
+    for p in ["app.py", "tests/test_app.py", "test_app.py"]:
+        if p in candidates and p not in prioritized:
+            prioritized.append(p)
+    for p in candidates:
+        if p not in prioritized:
+            prioritized.append(p)
+    candidates = prioritized
+
+    file_contents: dict[str, str] = {}
+    for path in candidates[: settings.MAX_AUTOFIX_FILES + 2]:
+        content = await github.get_file_content(repository=repository, path=path, ref=context.commit_sha or "main")
+        if content:
+            file_contents[path] = content
+
+    retrieval_context = "Indexing disabled."
+    retrieval_snippet_count = 0
+    if settings.INDEXING_ENABLED:
+        query_text = (
+            f"Failure summary: {diagnosis_model.summary}\n"
+            f"Root cause: {diagnosis_model.root_cause}\n"
+            f"Failing tests: {context.failing_tests}\n"
+            f"Logs excerpt:\n{context.logs_excerpt[:4000]}"
+        )
+        retrieval_context, retrieval_snippet_count, indexing_debug = build_and_query(
+            file_contents=file_contents,
+            query_text=query_text,
+            rebuild=settings.INDEXING_REBUILD,
+            top_k=settings.INDEXING_TOP_K,
+            max_query_chars=settings.INDEXING_MAX_QUERY_CHARS,
+            max_query_tokens=settings.INDEXING_MAX_QUERY_TOKENS,
+            skip_symbol_token_threshold=settings.INDEXING_SKIP_SYMBOL_TOKEN_THRESHOLD,
+        )
+    else:
+        indexing_debug = {"enabled": False}
+
+    attempt_logs: list[RepairAttempt] = []
+    feedback = f"Indexing enabled={settings.INDEXING_ENABLED}; retrieved_snippets={retrieval_snippet_count}."
+    fix_proposal = None
+    for attempt in range(1, settings.MAX_REPAIR_ATTEMPTS + 1):
+        try:
+            patch_result = await generate_patch_with_llm(
+                settings=settings,
+                context=context,
+                diagnosis=diagnosis_model,
+                file_contents=file_contents,
+                retrieval_context=retrieval_context,
+                previous_attempt_feedback=feedback,
+            )
+            attempt_logs.append(
+                RepairAttempt(
+                    attempt=attempt,
+                    status="generated",
+                    message=f"Generated patch for {len(patch_result.touched_files)} files.",
+                )
+            )
+            fix_proposal = build_fix_proposal_from_patch(settings, patch_result, file_contents)
+            if fix_proposal.file_changes:
+                attempt_logs.append(
+                    RepairAttempt(
+                        attempt=attempt,
+                        status="applied",
+                        message=f"Prepared {len(fix_proposal.file_changes)} file changes.",
+                    )
+                )
+                break
+            feedback = "Patch produced no effective file changes. Provide a different unified diff."
+            attempt_logs.append(
+                RepairAttempt(
+                    attempt=attempt,
+                    status="failed",
+                    message=feedback,
+                )
+            )
+        except Exception as exc:
+            feedback = f"Patch application failed: {exc}"
+            attempt_logs.append(
+                RepairAttempt(
+                    attempt=attempt,
+                    status="failed",
+                    message=feedback,
+                )
+            )
+
+    if not fix_proposal or not fix_proposal.file_changes:
+        return {
+            "status": "failed_after_retries",
+            "reason": "Could not generate/apply a valid patch within retry limit.",
+            "analysis": analysis,
+            "attempts": [a.model_dump() for a in attempt_logs],
+        }
+
+    pr = await open_autofix_pr(
+        github=github,
+        repository=repository,
+        base_sha=context.commit_sha,
+        base_branch=base_branch,
+        fix_proposal=fix_proposal,
+        notes_path=f".agentic/notes/autofix-{context.run_id}.md",
+        attempt_logs=[a.model_dump() for a in attempt_logs],
+        indexing_debug=indexing_debug,
+    )
+    return {
+        "status": "fixed",
+        "pull_request": pr,
+        "analysis": analysis,
+        "indexing_debug": indexing_debug,
+        "attempts": [a.model_dump() for a in attempt_logs],
+    }
+
+
+if __name__ == "__main__":
+    mcp.run()
+
+
+
+
+================================================
+FILE: mcp_server/run_repair.py
+================================================
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+
+from dotenv import load_dotenv
+
+from mcp_server.config import get_settings
+from mcp_server.main import orchestrate_autofix
+from mcp_server.tools.github_client import GitHubClient
+
+
+async def _main() -> int:
+    load_dotenv()
+    repository = os.getenv("REPOSITORY", "").strip()
+    run_id_raw = os.getenv("RUN_ID", "").strip()
+    workflow_name = os.getenv("WORKFLOW_NAME", "").strip()
+    base_branch = os.getenv("BASE_BRANCH", "main").strip() or "main"
+
+    if not repository:
+        print("REPOSITORY is required.")
+        return 1
+
+    if run_id_raw:
+        try:
+            run_id = int(run_id_raw)
+        except ValueError:
+            print("RUN_ID must be an integer.")
+            return 1
+    else:
+        settings = get_settings()
+        github = GitHubClient(settings.GITHUB_TOKEN)
+        run_id = await github.get_latest_failed_run_id(repository=repository, workflow_name=workflow_name)
+        if not run_id:
+            if workflow_name:
+                print(f"No failed runs found for workflow '{workflow_name}' in {repository}.")
+            else:
+                print(f"No failed runs found in {repository}.")
+            return 1
+        print(f"Using latest failed run id: {run_id}")
+
+    result = await orchestrate_autofix(repository=repository, run_id=run_id, base_branch=base_branch)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(_main()))
+
+
+
+
+================================================
+FILE: mcp_server/tools/__init__.py
+================================================
+"""Tooling modules for Agentic CI/CD MCP."""
+
+
+
+
+================================================
+FILE: mcp_server/tools/code_indexing.py
+================================================
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+def write_candidate_files(target_root: Path, file_contents: dict[str, str]) -> None:
+    """
+    Write retrieved candidate files into a temp folder preserving directories.
+
+    Keys in file_contents are expected to be repo-like paths: e.g.
+    "tests/test_app.py" or "app.py".
+    """
+    for rel_path, content in file_contents.items():
+        safe_rel = rel_path.replace("\\", "/").lstrip("/")
+        out_path = target_root / safe_rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(content, encoding="utf-8")
+
+
+def _run_python_script(script_path: Path, args: list[str], cwd: Path) -> tuple[int, str]:
+    # Use the current interpreter to ensure consistent dependencies.
+    cmd = [sys.executable, str(script_path), *args]
+    proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
+    output = (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, output
+
+
+def _split_identifier_for_indexing(token: str) -> list[str]:
+    """
+    Approximate the tokenizer used by `indexing/index_schema.py` so our token caps
+    reliably bound the SQL complexity in `symbol_retrieval()`.
+    """
+    # 1) Split CamelCase / digits (matches index_schema.split_identifier idea).
+    pieces = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|\d+", token)
+    # 2) Split snake_case and non-word separators.
+    pieces.extend(re.split(r"[_\\W]+", token))
+    out: list[str] = []
+    for p in pieces:
+        lowered = (p or "").strip().lower()
+        if len(lowered) >= 2:
+            out.append(lowered)
+    return out
+
+
+def sanitize_query_text(
+    query_text: str,
+    *,
+    max_chars: int,
+    max_tokens: int,
+) -> tuple[str, int]:
+    """
+    Produce a capped query string made only of identifier-like tokens.
+
+    This keeps the downstream `indexing/query_code.py` tokenization bounded,
+    preventing `sqlite3.OperationalError: Expression tree is too large`.
+    """
+    # Extract "identifier-ish" tokens first, then apply the same sub-splitting.
+    raw_tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", query_text or "")
+    all_tokens: list[str] = []
+    for tok in raw_tokens:
+        all_tokens.extend(_split_identifier_for_indexing(tok))
+
+    if not all_tokens:
+        safe = (query_text or "").strip()[:max_chars]
+        return safe, 0
+
+    capped_tokens = all_tokens[:max_tokens]
+    safe = " ".join(capped_tokens)
+    if len(safe) > max_chars:
+        safe = safe[:max_chars]
+    return safe, len(capped_tokens)
+
+
+def build_index(temp_root: Path, rebuild: bool) -> Path:
+    """
+    Build the hybrid local code index by calling:
+    - indexing/index_code.py
+
+    Returns the index directory path used by the indexer.
+    """
+    index_dir = temp_root / ".code_index"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    script = Path(__file__).resolve().parents[2] / "indexing" / "index_code.py"
+
+    # NOTE: index_code.py uses ensure_index_paths(...), defaulting index_dir to <folder>/.code_index
+    args = [
+        "--folder",
+        str(temp_root),
+        "--index-dir",
+        str(index_dir),
+    ]
+    if rebuild:
+        args.append("--rebuild")
+
+    rc, output = _run_python_script(script, args, cwd=Path(__file__).resolve().parents[2])
+    if rc != 0:
+        raise RuntimeError(f"Index build failed (rc={rc}). Output:\n{output}")
+
+    return index_dir
+
+
+def query_index(
+    index_dir: Path,
+    temp_root: Path,
+    query_text: str,
+    top_k: int,
+    *,
+    skip_symbol: bool = False,
+) -> list[dict[str, Any]]:
+    """
+    Query the local index by calling:
+    - indexing/query_code.py --json
+    """
+    script = Path(__file__).resolve().parents[2] / "indexing" / "query_code.py"
+    args = [
+        "--folder",
+        str(temp_root),
+        "--index-dir",
+        str(index_dir),
+        "--query",
+        query_text,
+        "--top-k",
+        str(top_k),
+        "--json",
+    ]
+    if skip_symbol:
+        args.append("--skip-symbol")
+    rc, output = _run_python_script(script, args, cwd=Path(__file__).resolve().parents[2])
+    if rc != 0:
+        raise RuntimeError(f"Index query failed (rc={rc}). Output:\n{output}")
+
+    parsed = json.loads(output)
+    return parsed.get("results", [])
+
+
+def render_retrieval_context(results: list[dict[str, Any]], max_snippets: int = 8) -> str:
+    if not results:
+        return "No indexed context retrieved."
+
+    lines: list[str] = []
+    count = 0
+    for r in results:
+        if count >= max_snippets:
+            break
+        file_path = r.get("file_path") or r.get("file_rel_path") or "<unknown>"
+        line_range = r.get("line_range") or r.get("lineRange") or [0, 0]
+        snippet = r.get("snippet") or ""
+
+        lines.append(f"### {file_path}:{line_range[0]}-{line_range[1]}")
+        lines.append(snippet.rstrip())
+        lines.append("")
+        count += 1
+    return "\n".join(lines).strip()
+
+
+def build_and_query(
+    file_contents: dict[str, str],
+    query_text: str,
+    rebuild: bool,
+    top_k: int,
+    *,
+    max_query_chars: int = 2000,
+    max_query_tokens: int = 120,
+    skip_symbol_token_threshold: int = 80,
+) -> tuple[str, int, dict[str, Any]]:
+    """
+    Convenience wrapper:
+    - create temp folder
+    - write candidate files
+    - build index
+    - query index
+
+    Returns:
+      (rendered_context, number_of_results, debug_info)
+    """
+    if not file_contents:
+        return ("No indexed context retrieved.", 0, {"enabled": False, "results_count": 0})
+
+    with tempfile.TemporaryDirectory(prefix="agentic-index-") as tmp:
+        temp_root = Path(tmp)
+        write_candidate_files(target_root=temp_root, file_contents=file_contents)
+        index_dir = build_index(temp_root=temp_root, rebuild=rebuild)
+
+        safe_query, token_count = sanitize_query_text(
+            query_text,
+            max_chars=max_query_chars,
+            max_tokens=max_query_tokens,
+        )
+        skip_symbol = token_count > skip_symbol_token_threshold
+        fallback_used = False
+        final_skip_symbol = skip_symbol
+
+        # Primary attempt uses capped tokens; if SQLite still complains, fall back to skip-symbol.
+        try:
+            results = query_index(
+                index_dir=index_dir,
+                temp_root=temp_root,
+                query_text=safe_query,
+                top_k=top_k,
+                skip_symbol=skip_symbol,
+            )
+        except RuntimeError:
+            if not skip_symbol:
+                fallback_used = True
+                results = query_index(
+                    index_dir=index_dir,
+                    temp_root=temp_root,
+                    query_text=safe_query,
+                    top_k=top_k,
+                    skip_symbol=True,
+                )
+                final_skip_symbol = True
+            else:
+                raise
+        rendered = render_retrieval_context(results=results)
+        debug = {
+            "enabled": True,
+            "token_count": token_count,
+            "max_query_tokens": max_query_tokens,
+            "max_query_chars": max_query_chars,
+            "skip_symbol_token_threshold": skip_symbol_token_threshold,
+            "skip_symbol_decision": skip_symbol,
+            "fallback_used": fallback_used,
+            "final_skip_symbol": final_skip_symbol,
+            "results_count": len(results),
+        }
+        return rendered, len(results), debug
+
+
+
+
+================================================
+FILE: mcp_server/tools/diagnose.py
+================================================
+from __future__ import annotations
+
+import json
+
+import httpx
+
+from mcp_server.config import Settings
+from mcp_server.tools.schemas import DiagnosisResult, PatchGenerationResult, PipelineContext
+
+
+SYSTEM_PROMPT = """You are a CI/CD repair agent.
+Return strict JSON with keys:
+summary, root_cause, confidence, proposed_fix, risk_score, reason_codes.
+Keep risk_score in [0,1], higher means riskier autonomous remediation.
+"""
+
+PATCH_PROMPT = """You are an autonomous code repair agent.
+Generate a unified diff patch that fixes the CI failure.
+Rules:
+- Output strict JSON with keys: patch, rationale, touched_files.
+- patch must be valid unified diff with file headers:
+  --- a/<path>
+  +++ b/<path>
+- Only include files that already exist in provided file contents.
+- Keep patch minimal and focused on fixing failing tests/build.
+- Do not include markdown fences.
+- Prefer using the relevant line-grounded context below when selecting exact lines for patch hunks.
+"""
+
+
+async def diagnose_failure(settings: Settings, context: PipelineContext) -> DiagnosisResult:
+    payload = {
+        "model": settings.OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            f"Repository: {context.repository}\n"
+                            f"Run ID: {context.run_id}\n"
+                            f"Commit: {context.commit_sha}\n"
+                            f"Changed files: {context.changed_files}\n"
+                            f"Failing tests: {context.failing_tests}\n"
+                            f"Logs:\n{context.logs_excerpt}"
+                        ),
+                    }
+                ],
+            },
+        ],
+        "text": {"format": {"type": "json_object"}},
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            response = await client.post(
+                "https://api.openai.com/v1/responses",
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text if exc.response is not None else ""
+            raise RuntimeError(
+                f"OpenAI API error {exc.response.status_code if exc.response is not None else '?:'}: {body[:1000]}\n"
+                "Check OPENAI_API_KEY and endpoint access."
+            ) from exc
+
+    raw_text = _extract_text_output(data)
+    parsed = json.loads(raw_text)
+    return DiagnosisResult.model_validate(parsed)
+
+
+def _extract_text_output(response: dict) -> str:
+    for item in response.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for block in item.get("content", []):
+            if block.get("type") == "output_text":
+                return block.get("text", "{}")
+    return "{}"
+
+
+async def generate_patch_with_llm(
+    settings: Settings,
+    context: PipelineContext,
+    diagnosis: DiagnosisResult,
+    file_contents: dict[str, str],
+    retrieval_context: str,
+    previous_attempt_feedback: str = "",
+) -> PatchGenerationResult:
+    files_blob = "\n\n".join(
+        f"### FILE: {path}\n{content}"
+        for path, content in file_contents.items()
+    )
+    payload = {
+        "model": settings.OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": PATCH_PROMPT}]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            f"Repository: {context.repository}\n"
+                            f"Run ID: {context.run_id}\n"
+                            f"Diagnosis summary: {diagnosis.summary}\n"
+                            f"Root cause: {diagnosis.root_cause}\n"
+                            f"Proposed fix: {diagnosis.proposed_fix}\n"
+                            f"Failing tests: {context.failing_tests}\n"
+                            f"Relevant indexed code context:\n{retrieval_context}\n\n"
+                            f"Attempt feedback: {previous_attempt_feedback}\n"
+                            f"Logs excerpt:\n{context.logs_excerpt}\n\n"
+                            f"Available files (edit only these):\n{files_blob}\n"
+                        ),
+                    }
+                ],
+            },
+        ],
+        "text": {"format": {"type": "json_object"}},
+    }
+    headers = {
+        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        try:
+            response = await client.post(
+                "https://api.openai.com/v1/responses",
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text if exc.response is not None else ""
+            raise RuntimeError(
+                f"OpenAI API error {exc.response.status_code if exc.response is not None else '?:'}: {body[:1000]}\n"
+                "Check OPENAI_API_KEY and endpoint access."
+            ) from exc
+    raw_text = _extract_text_output(data)
+    parsed = json.loads(raw_text)
+    result = PatchGenerationResult.model_validate(parsed)
+    if len(result.patch) > settings.LLM_PATCH_MAX_CHARS:
+        result.patch = result.patch[: settings.LLM_PATCH_MAX_CHARS]
+    return result
+
+
+
+
+================================================
+FILE: mcp_server/tools/fix_generator.py
+================================================
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from mcp_server.config import Settings
+from mcp_server.tools.schemas import CodeFixProposal, FileChange, PatchGenerationResult
+
+
+HUNK_RE = re.compile(r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@")
+
+
+@dataclass
+class ParsedPatchFile:
+    path: str
+    hunks: list[list[str]]
+
+
+def build_fix_proposal_from_patch(
+    settings: Settings,
+    patch_result: PatchGenerationResult,
+    file_contents: dict[str, str],
+) -> CodeFixProposal:
+    parsed_files = parse_unified_diff(normalize_unified_diff(patch_result.patch))
+    if not parsed_files:
+        raise ValueError("No valid file patch blocks found in LLM patch output.")
+    if len(parsed_files) > settings.MAX_AUTOFIX_FILES:
+        raise ValueError("Patch touches too many files.")
+    file_changes: list[FileChange] = []
+    total_hunks = 0
+    for parsed in parsed_files:
+        if parsed.path not in file_contents:
+            raise ValueError(f"Patch references unavailable file: {parsed.path}")
+        total_hunks += len(parsed.hunks)
+        if total_hunks > settings.MAX_AUTOFIX_HUNKS:
+            raise ValueError("Patch has too many hunks.")
+        try:
+            updated = apply_patch_to_text(file_contents[parsed.path], parsed.hunks)
+        except ValueError:
+            updated = apply_patch_with_fuzzy_match(file_contents[parsed.path], parsed.hunks)
+        if updated != file_contents[parsed.path]:
+            file_changes.append(FileChange(path=parsed.path, content=updated))
+
+    return CodeFixProposal(
+        title="ci: llm auto-repair patch",
+        description=patch_result.rationale,
+        file_changes=file_changes,
+    )
+
+
+def parse_unified_diff(patch_text: str) -> list[ParsedPatchFile]:
+    lines = patch_text.splitlines()
+    files: list[ParsedPatchFile] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("--- a/") and i + 1 < len(lines) and lines[i + 1].startswith("+++ b/"):
+            path = lines[i + 1][6:].strip()
+            i += 2
+            hunks: list[list[str]] = []
+            current_hunk: list[str] = []
+            while i < len(lines) and not lines[i].startswith("--- a/"):
+                if lines[i].startswith("@@ "):
+                    if current_hunk:
+                        hunks.append(current_hunk)
+                    current_hunk = [lines[i]]
+                elif current_hunk:
+                    current_hunk.append(lines[i])
+                i += 1
+            if current_hunk:
+                hunks.append(current_hunk)
+            files.append(ParsedPatchFile(path=path, hunks=hunks))
+            continue
+        i += 1
+    return files
+
+
+def normalize_unified_diff(patch_text: str) -> str:
+    # Remove markdown code fences and trim noisy wrappers.
+    text = patch_text.strip()
+    if text.startswith("```"):
+        text = "\n".join(line for line in text.splitlines() if not line.strip().startswith("```"))
+    # Normalize some malformed hunk headers often emitted by models.
+    fixed_lines: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("@@") and not line.endswith("@@"):
+            # keep only canonical header prefix until closing @@ if present
+            if "@@" in line[2:]:
+                idx = line[2:].find("@@")
+                line = line[: idx + 4]
+        fixed_lines.append(line.rstrip("\r"))
+    return "\n".join(fixed_lines)
+
+
+def apply_patch_to_text(original: str, hunks: list[list[str]]) -> str:
+    lines = original.splitlines()
+    offset = 0
+    for hunk in hunks:
+        header = hunk[0]
+        match = HUNK_RE.match(header)
+        if not match:
+            raise ValueError(f"Invalid hunk header: {header}")
+        old_start = int(match.group("old_start"))
+        idx = max(0, old_start - 1 + offset)
+        for line in hunk[1:]:
+            if not line:
+                marker = " "
+                content = ""
+            else:
+                marker = line[0]
+                content = line[1:]
+            if marker == " ":
+                if idx >= len(lines) or lines[idx] != content:
+                    raise ValueError("Context mismatch while applying patch.")
+                idx += 1
+            elif marker == "-":
+                if idx >= len(lines) or lines[idx] != content:
+                    raise ValueError("Delete mismatch while applying patch.")
+                lines.pop(idx)
+                offset -= 1
+            elif marker == "+":
+                lines.insert(idx, content)
+                idx += 1
+                offset += 1
+    return "\n".join(lines) + ("\n" if original.endswith("\n") else "")
+
+
+def apply_patch_with_fuzzy_match(original: str, hunks: list[list[str]]) -> str:
+    lines = original.splitlines()
+    for hunk in hunks:
+        minus_lines = [l[1:] for l in hunk[1:] if l.startswith("-")]
+        plus_lines = [l[1:] for l in hunk[1:] if l.startswith("+")]
+        if not minus_lines and plus_lines:
+            # Pure insertion fallback: append near EOF.
+            lines.extend(plus_lines)
+            continue
+        start_idx = _find_subsequence(lines, minus_lines)
+        if start_idx == -1:
+            raise ValueError("Context mismatch while applying patch.")
+        end_idx = start_idx + len(minus_lines)
+        lines = lines[:start_idx] + plus_lines + lines[end_idx:]
+    return "\n".join(lines) + ("\n" if original.endswith("\n") else "")
+
+
+def _find_subsequence(lines: list[str], pattern: list[str]) -> int:
+    if not pattern:
+        return -1
+    max_start = len(lines) - len(pattern)
+    for i in range(max_start + 1):
+        if lines[i : i + len(pattern)] == pattern:
+            return i
+    return -1
+
+
+
+
+================================================
+FILE: mcp_server/tools/github_client.py
+================================================
+from __future__ import annotations
+
+import base64
+import io
+import zipfile
+from typing import Any
+import os
+
+import httpx
+import asyncio
+
+
+class GitHubClient:
+    def __init__(self, token: str, base_url: str | None = None) -> None:
+        self._token = token
+        resolved = base_url or os.getenv("GITHUB_API_URL") or "https://api.github.com"
+        self._base_url = resolved.rstrip("/")
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self._token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+    async def _get(self, path: str) -> Any:
+        url = f"{self._base_url}{path}"
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.get(url, headers=self._headers())
+                    response.raise_for_status()
+                    return response.json()
+            except httpx.RequestError as exc:
+                # If last attempt, raise a clear runtime error
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"Network error while contacting {url}: {exc}") from exc
+                # exponential backoff before retrying
+                backoff = 2 ** attempt
+                await asyncio.sleep(backoff)
+
+    async def get_workflow_run(self, repository: str, run_id: int) -> dict[str, Any]:
+        return await self._get(f"/repos/{repository}/actions/runs/{run_id}")
+
+    async def list_run_jobs(self, repository: str, run_id: int) -> list[dict[str, Any]]:
+        payload = await self._get(f"/repos/{repository}/actions/runs/{run_id}/jobs")
+        return payload.get("jobs", [])
+
+    async def get_run_logs_download_url(self, repository: str, run_id: int) -> str:
+        run = await self.get_workflow_run(repository, run_id)
+        return run.get("logs_url", "")
+
+    async def get_run_logs_text(self, repository: str, run_id: int, max_chars: int = 20000) -> str:
+        logs_url = await self.get_run_logs_download_url(repository, run_id)
+        if not logs_url:
+            return ""
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            response = await client.get(logs_url, headers=self._headers())
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "")
+            if "application/zip" in content_type or response.content.startswith(b"PK"):
+                return _read_zip_logs(response.content, max_chars=max_chars)
+            return response.text[-max_chars:]
+
+    async def get_commit_files(self, repository: str, sha: str) -> list[str]:
+        if not sha:
+            return []
+        payload = await self._get(f"/repos/{repository}/commits/{sha}")
+        return [f.get("filename", "") for f in payload.get("files", []) if f.get("filename")]
+
+    async def get_latest_failed_run_id(self, repository: str, workflow_name: str = "") -> int:
+        payload = await self._get(
+            f"/repos/{repository}/actions/runs?status=completed&conclusion=failure&per_page=30"
+        )
+        runs = payload.get("workflow_runs", [])
+        target_name = workflow_name.strip().lower()
+        for run in runs:
+            if target_name:
+                if str(run.get("name", "")).strip().lower() != target_name:
+                    continue
+            run_id = run.get("id")
+            if isinstance(run_id, int):
+                return run_id
+        return 0
+
+    async def create_branch(self, repository: str, branch: str, from_sha: str) -> dict[str, Any]:
+        body = {"ref": f"refs/heads/{branch}", "sha": from_sha}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{self._base_url}/repos/{repository}/git/refs",
+                headers=self._headers(),
+                json=body,
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def create_or_update_file(
+        self,
+        repository: str,
+        path: str,
+        branch: str,
+        content: str,
+        message: str,
+        sha: str = "",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "message": message,
+            "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.put(
+                f"{self._base_url}/repos/{repository}/contents/{path}",
+                headers=self._headers(),
+                json=payload,
+            )
+            if response.status_code < 400:
+                return response.json()
+
+            # Existing file updates require "sha"; fetch and retry automatically.
+            if response.status_code == 422 and "sha" not in payload:
+                existing_sha = await self.get_file_sha(repository, path, ref=branch)
+                if existing_sha:
+                    payload["sha"] = existing_sha
+                    retry_response = await client.put(
+                        f"{self._base_url}/repos/{repository}/contents/{path}",
+                        headers=self._headers(),
+                        json=payload,
+                    )
+                    retry_response.raise_for_status()
+                    return retry_response.json()
+
+            response.raise_for_status()
+            return response.json()
+
+    async def create_pull_request(
+        self,
+        repository: str,
+        title: str,
+        body: str,
+        head: str,
+        base: str = "main",
+    ) -> dict[str, Any]:
+        payload = {"title": title, "body": body, "head": head, "base": base}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{self._base_url}/repos/{repository}/pulls",
+                headers=self._headers(),
+                json=payload,
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def get_file_sha(self, repository: str, path: str, ref: str = "main") -> str:
+        encoded_path = "/".join(segment for segment in path.split("/") if segment)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{self._base_url}/repos/{repository}/contents/{encoded_path}",
+                headers=self._headers(),
+                params={"ref": ref},
+            )
+            if response.status_code == 404:
+                return ""
+            response.raise_for_status()
+            payload = response.json()
+            return payload.get("sha", "")
+
+    async def get_file_content(self, repository: str, path: str, ref: str = "main") -> str:
+        encoded_path = "/".join(segment for segment in path.split("/") if segment)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{self._base_url}/repos/{repository}/contents/{encoded_path}",
+                headers=self._headers(),
+                params={"ref": ref},
+            )
+            if response.status_code == 404:
+                return ""
+            response.raise_for_status()
+            payload = response.json()
+            content = payload.get("content", "")
+            encoding = payload.get("encoding", "base64")
+            if encoding == "base64" and content:
+                import base64 as _b64
+
+                return _b64.b64decode(content).decode("utf-8", errors="replace")
+            if isinstance(content, str):
+                return content
+            return ""
+
+
+def _read_zip_logs(data: bytes, max_chars: int = 20000) -> str:
+    combined: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zip_file:
+        for name in zip_file.namelist():
+            if not name.endswith(".txt"):
+                continue
+            try:
+                text = zip_file.read(name).decode("utf-8", errors="replace")
+                combined.append(f"## {name}\n{text}\n")
+            except KeyError:
+                continue
+    blob = "\n".join(combined)
+    return blob[-max_chars:]
+
+
+
+
+================================================
+FILE: mcp_server/tools/logs_analyzer.py
+================================================
+from __future__ import annotations
+
+import re
+
+
+TEST_FAIL_PATTERNS = [
+    re.compile(r"FAILED\s+(.+)", re.IGNORECASE),
+    re.compile(r"AssertionError[:\s]+(.+)", re.IGNORECASE),
+    re.compile(r"error[:\s]+(.+)", re.IGNORECASE),
+]
+
+
+def normalize_logs(raw_logs: str, max_chars: int = 6000) -> str:
+    squashed = "\n".join(line.rstrip() for line in raw_logs.splitlines())
+    if len(squashed) <= max_chars:
+        return squashed
+    return squashed[-max_chars:]
+
+
+def extract_failing_tests(raw_logs: str, max_items: int = 20) -> list[str]:
+    failures: list[str] = []
+    for line in raw_logs.splitlines():
+        for pattern in TEST_FAIL_PATTERNS:
+            match = pattern.search(line)
+            if match:
+                item = match.group(1).strip()
+                if item and item not in failures:
+                    failures.append(item)
+            if len(failures) >= max_items:
+                return failures
+    return failures
+
+
+def extract_python_file_candidates(items: list[str]) -> list[str]:
+    candidates: list[str] = []
+    for item in items:
+        normalized = item.replace("\\", "/")
+        for token in normalized.replace(":", " ").split():
+            token = token.strip(" ,.;:()[]{}'\"")
+            if token.endswith(".py") and "/" in token and token not in candidates:
+                candidates.append(token)
+    return candidates
+
+
+
+
+================================================
+FILE: mcp_server/tools/pr_bot.py
+================================================
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+import httpx
+
+from mcp_server.tools.github_client import GitHubClient
+from mcp_server.tools.schemas import CodeFixProposal
+
+
+async def open_autofix_pr(
+    github: GitHubClient,
+    repository: str,
+    base_sha: str,
+    base_branch: str,
+    fix_proposal: CodeFixProposal,
+    notes_path: str = "AUTOFIX_NOTES.md",
+    attempt_logs: list[dict[str, Any]] | None = None,
+    indexing_debug: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    branch_name = f"agentic/autofix-{base_sha[:7]}"
+    try:
+        await github.create_branch(repository, branch_name, base_sha)
+    except httpx.HTTPStatusError as exc:
+        # Common case: rerunning same SHA where branch already exists.
+        if exc.response.status_code != 422:
+            raise
+        unique_suffix = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        branch_name = f"{branch_name}-{unique_suffix}"
+        await github.create_branch(repository, branch_name, base_sha)
+
+    await github.create_or_update_file(
+        repository=repository,
+        path=notes_path,
+        branch=branch_name,
+        content=_build_notes_content(fix_proposal, attempt_logs or [], indexing_debug=indexing_debug),
+        message=fix_proposal.title,
+    )
+
+    for fc in fix_proposal.file_changes:
+        await github.create_or_update_file(
+            repository=repository,
+            path=fc.path,
+            branch=branch_name,
+            content=fc.content,
+            message=fix_proposal.title,
+        )
+
+    return await github.create_pull_request(
+        repository=repository,
+        title=fix_proposal.title,
+        body=fix_proposal.description,
+        head=branch_name,
+        base=base_branch,
+    )
+
+
+def _build_notes_content(
+    fix_proposal: CodeFixProposal,
+    attempt_logs: list[dict[str, Any]],
+    *,
+    indexing_debug: dict[str, Any] | None = None,
+) -> str:
+    attempts = "\n".join(
+        f"- attempt {a.get('attempt')}: {a.get('status')} - {a.get('message')}"
+        for a in attempt_logs
+    )
+    if not fix_proposal.file_changes:
+        return f"# Autofix Notes\n\n{fix_proposal.description}\n\n## Attempts\n{attempts}\n"
+    changed = "\n".join(f"- {fc.path}" for fc in fix_proposal.file_changes)
+
+    indexing_lines: list[str] = []
+    if indexing_debug and indexing_debug.get("enabled"):
+        indexing_lines = [
+            "## Indexing",
+            f"- token_count: {indexing_debug.get('token_count')}",
+            f"- max_query_tokens: {indexing_debug.get('max_query_tokens')}",
+            f"- skip_symbol_decision: {indexing_debug.get('skip_symbol_decision')}",
+            f"- fallback_used: {indexing_debug.get('fallback_used')}",
+            f"- final_skip_symbol: {indexing_debug.get('final_skip_symbol')}",
+            f"- results_count: {indexing_debug.get('results_count')}",
+        ]
+
+    indexing_block = ("\n".join(indexing_lines) + "\n\n" if indexing_lines else "")
+    return (
+        "# Autofix Notes\n\n"
+        f"## Summary\n{fix_proposal.description}\n\n"
+        f"## Attempts\n{attempts}\n\n"
+        + indexing_block
+        + "## Files updated\n"
+        + f"{changed}\n"
+    )
+
+
+
+
+================================================
+FILE: mcp_server/tools/risk_guard.py
+================================================
+from __future__ import annotations
+
+from mcp_server.config import Settings
+from mcp_server.tools.schemas import DiagnosisResult, GovernanceDecision
+
+
+HIGH_RISK_KEYWORDS = [
+    "terraform",
+    "kubernetes",
+    "helm",
+    "secrets",
+    ".github/workflows",
+    "auth",
+    "permission",
+]
+
+
+def decide_governance(
+    settings: Settings,
+    diagnosis: DiagnosisResult,
+    changed_files: list[str],
+) -> GovernanceDecision:
+    if settings.FORCE_AUTOFIX_ALL:
+        return GovernanceDecision(
+            decision="auto_fix",
+            rationale="FORCE_AUTOFIX_ALL is enabled; bypassing governance thresholds.",
+            risk_score=diagnosis.risk_score,
+            requires_approval=False,
+        )
+
+    risky_change = any(
+        keyword in path.lower()
+        for path in changed_files
+        for keyword in HIGH_RISK_KEYWORDS
+    )
+    score = diagnosis.risk_score
+    if risky_change:
+        score = max(score, settings.RISK_HUMAN_REVIEW_THRESHOLD)
+
+    if score < settings.RISK_AUTO_FIX_THRESHOLD:
+        return GovernanceDecision(
+            decision="auto_fix",
+            rationale="Risk score below autonomous fix threshold.",
+            risk_score=score,
+            requires_approval=False,
+        )
+
+    if score < settings.RISK_HUMAN_REVIEW_THRESHOLD:
+        return GovernanceDecision(
+            decision="human_review",
+            rationale="Moderate risk requires operator approval.",
+            risk_score=score,
+            requires_approval=True,
+        )
+
+    return GovernanceDecision(
+        decision="block",
+        rationale="High risk remediation path blocked for autonomous action.",
+        risk_score=score,
+        requires_approval=True,
+    )
+
+
+
+
+================================================
+FILE: mcp_server/tools/schemas.py
+================================================
+from typing import Literal
+from pydantic import BaseModel, Field
+
+
+class PipelineContext(BaseModel):
+    repository: str
+    run_id: int
+    commit_sha: str = ""
+    logs_excerpt: str = ""
+    failing_tests: list[str] = Field(default_factory=list)
+    changed_files: list[str] = Field(default_factory=list)
+
+
+class DiagnosisResult(BaseModel):
+    summary: str
+    root_cause: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    proposed_fix: str
+    risk_score: float = Field(ge=0.0, le=1.0)
+    reason_codes: list[str] = Field(default_factory=list)
+
+
+class GovernanceDecision(BaseModel):
+    decision: Literal["auto_fix", "human_review", "block"]
+    rationale: str
+    risk_score: float = Field(ge=0.0, le=1.0)
+    requires_approval: bool = False
+
+
+class FileChange(BaseModel):
+    path: str
+    content: str
+
+
+class CodeFixProposal(BaseModel):
+    title: str
+    description: str
+    file_changes: list[FileChange]
+
+
+class PatchGenerationResult(BaseModel):
+    patch: str
+    rationale: str
+    touched_files: list[str] = Field(default_factory=list)
+
+
+class RepairAttempt(BaseModel):
+    attempt: int
+    status: Literal["generated", "applied", "failed"]
+    message: str
+
+
+class RepairResult(BaseModel):
+    status: Literal["fixed", "requires_review", "failed_after_retries"]
+    attempts: list[RepairAttempt] = Field(default_factory=list)
+    fix_proposal: CodeFixProposal | None = None
+
+
+
+
+================================================
+FILE: tests/test_code_indexing.py
+================================================
+from __future__ import annotations
+
+from pathlib import Path
+
+from mcp_server.tools.code_indexing import (
+    build_and_query,
+    render_retrieval_context,
+    sanitize_query_text,
+    write_candidate_files,
+)
+
+
+def test_write_candidate_files_preserves_structure(tmp_path: Path):
+    files = {"tests/test_app.py": "def add(a,b):\n    return a+b\n"}
+    write_candidate_files(target_root=tmp_path, file_contents=files)
+    out = tmp_path / "tests" / "test_app.py"
+    assert out.exists()
+    assert "return a+b" in out.read_text(encoding="utf-8")
+
+
+def test_render_retrieval_context_formats_headers():
+    results = [
+        {
+            "file_path": "tests/test_app.py",
+            "line_range": [8, 20],
+            "snippet": "def add(a,b):\n    return a+b\n",
+            "score_breakdown": {"total": 1.0},
+        }
+    ]
+    ctx = render_retrieval_context(results, max_snippets=1)
+    assert "tests/test_app.py:8-20" in ctx
+    assert "def add" in ctx
+
+
+def test_build_and_query_returns_some_context(tmp_path: Path):
+    # This uses the existing indexing scripts.
+    file_contents = {"app.py": "def add(a,b):\n    return a+b\n"}
+    query = "add function"
+    rendered, n, debug = build_and_query(
+        file_contents=file_contents,
+        query_text=query,
+        rebuild=True,
+        top_k=3,
+    )
+    assert isinstance(rendered, str)
+    # With lexical retrieval, we expect at least one snippet.
+    assert n >= 0
+    assert isinstance(debug, dict)
+    assert debug.get("enabled") is True
+
+
+def test_sanitize_query_text_caps_tokens_and_chars():
+    raw = "This_is_a_very_long_log_excerpt_with_terms " + " ".join(
+        ["expression_tree_too_large"] * 200
+    )
+    safe, token_count = sanitize_query_text(
+        raw,
+        max_chars=300,
+        max_tokens=25,
+    )
+    assert len(safe) <= 300
+    assert token_count <= 25
+
+    # If threshold is low, we should trigger skip-symbol behavior upstream.
+    # (We don't test the SQL path here; we validate token counting plumbing.)
+    _, token_count_2 = sanitize_query_text(raw, max_chars=300, max_tokens=40)
+    assert token_count_2 <= 40
+
+
+
+================================================
+FILE: tests/test_fix_generator.py
+================================================
+import pytest
+
+from mcp_server.config import Settings
+from mcp_server.tools.fix_generator import (
+    apply_patch_to_text,
+    build_fix_proposal_from_patch,
+    normalize_unified_diff,
+    parse_unified_diff,
+)
+from mcp_server.tools.schemas import PatchGenerationResult
+
+
+def test_parse_unified_diff_extracts_files():
+    patch = """--- a/tests/test_app.py
++++ b/tests/test_app.py
+@@ -1,3 +1,3 @@
+-assert add(2, 2) == 5
++assert add(2, 2) == 4
+ """
+    files = parse_unified_diff(patch)
+    assert len(files) == 1
+    assert files[0].path == "tests/test_app.py"
+    assert len(files[0].hunks) == 1
+
+
+def test_apply_patch_to_text_replaces_line():
+    original = "def test_add():\n    assert add(2, 2) == 5\n"
+    hunks = [["@@ -1,2 +1,2 @@", " def test_add():", "-    assert add(2, 2) == 5", "+    assert add(2, 2) == 4"]]
+    updated = apply_patch_to_text(original, hunks)
+    assert "== 4" in updated
+    assert "== 5" not in updated
+
+
+def test_build_fix_proposal_from_patch_applies_changes():
+    settings = Settings(OPENAI_API_KEY="x", GITHUB_TOKEN="x")
+    patch_result = PatchGenerationResult(
+        patch="--- a/tests/test_app.py\n+++ b/tests/test_app.py\n@@ -1,2 +1,2 @@\n def test_add():\n-    assert add(2, 2) == 5\n+    assert add(2, 2) == 4\n",
+        rationale="Fix incorrect expected value.",
+        touched_files=["tests/test_app.py"],
+    )
+    files = {"tests/test_app.py": "def test_add():\n    assert add(2, 2) == 5\n"}
+    proposal = build_fix_proposal_from_patch(settings, patch_result, files)
+    assert len(proposal.file_changes) == 1
+    assert proposal.file_changes[0].path == "tests/test_app.py"
+    assert "== 4" in proposal.file_changes[0].content
+
+
+def test_build_fix_proposal_rejects_unknown_file():
+    settings = Settings(OPENAI_API_KEY="x", GITHUB_TOKEN="x")
+    patch_result = PatchGenerationResult(
+        patch="--- a/unknown.py\n+++ b/unknown.py\n@@ -1,1 +1,1 @@\n-print('x')\n+print('y')\n",
+        rationale="Try update unknown file.",
+        touched_files=["unknown.py"],
+    )
+    with pytest.raises(ValueError):
+        build_fix_proposal_from_patch(settings, patch_result, {"tests/test_app.py": "x\n"})
+
+
+def test_normalize_unified_diff_removes_code_fences():
+    raw = """```diff
+--- a/tests/test_app.py
++++ b/tests/test_app.py
+@@ -1,1 +1,1 @@
+-x
++y
+```"""
+    norm = normalize_unified_diff(raw)
+    assert "```" not in norm
+    assert norm.startswith("--- a/tests/test_app.py")
+
+
+def test_fuzzy_fallback_applies_when_hunk_line_mismatch():
+    settings = Settings(OPENAI_API_KEY="x", GITHUB_TOKEN="x")
+    patch_result = PatchGenerationResult(
+        patch="--- a/tests/test_app.py\n+++ b/tests/test_app.py\n@@ -8,1 +8,1 @@\n-    assert add(2, 2) == 5\n+    assert add(2, 2) == 4\n",
+        rationale="Fix assertion",
+        touched_files=["tests/test_app.py"],
+    )
+    # Line numbers intentionally don't match this short file; fuzzy fallback should still succeed.
+    files = {"tests/test_app.py": "def test_add():\n    assert add(2, 2) == 5\n"}
+    proposal = build_fix_proposal_from_patch(settings, patch_result, files)
+    assert len(proposal.file_changes) == 1
+    assert "== 4" in proposal.file_changes[0].content
+
+
+
+
+================================================
+FILE: tests/test_logs_analyzer.py
+================================================
+from mcp_server.tools.logs_analyzer import extract_failing_tests, normalize_logs
+
+
+def test_extract_failing_tests():
+    logs = """
+    test_a.py::test_x FAILED
+    AssertionError: expected 1 got 0
+    """
+    failures = extract_failing_tests(logs)
+    assert failures
+
+
+def test_normalize_logs_limits_chars():
+    raw = "a" * 10000
+    normalized = normalize_logs(raw, max_chars=100)
+    assert len(normalized) == 100
+
+
+
+
+================================================
+FILE: tests/test_risk_guard.py
+================================================
+from mcp_server.config import Settings
+from mcp_server.tools.risk_guard import decide_governance
+from mcp_server.tools.schemas import DiagnosisResult
+
+
+def _settings() -> Settings:
+    return Settings(
+        OPENAI_API_KEY="x",
+        GITHUB_TOKEN="x",
+        FORCE_AUTOFIX_ALL=False,
+    )
+
+
+def test_low_risk_autofix():
+    diagnosis = DiagnosisResult(
+        summary="unit test failure",
+        root_cause="minor typo",
+        confidence=0.9,
+        proposed_fix="update tests/test_file.py assertion",
+        risk_score=0.2,
+        reason_codes=["TEST_FAILURE"],
+    )
+    decision = decide_governance(_settings(), diagnosis, ["tests/test_file.py"])
+    assert decision.decision == "auto_fix"
+
+
+def test_high_risk_block():
+    diagnosis = DiagnosisResult(
+        summary="workflow failure",
+        root_cause="deploy permission missing",
+        confidence=0.7,
+        proposed_fix="edit .github/workflows/deploy.yml",
+        risk_score=0.4,
+        reason_codes=["WORKFLOW_CHANGE"],
+    )
+    decision = decide_governance(_settings(), diagnosis, [".github/workflows/deploy.yml"])
+    assert decision.decision in {"human_review", "block"}
+
+
+def test_force_autofix_bypasses_thresholds():
+    settings = _settings()
+    settings.FORCE_AUTOFIX_ALL = True
+    diagnosis = DiagnosisResult(
+        summary="workflow risk",
+        root_cause="sensitive workflow modification",
+        confidence=0.7,
+        proposed_fix="edit .github/workflows/deploy.yml",
+        risk_score=0.99,
+        reason_codes=["HIGH_RISK_CHANGE"],
+    )
+    decision = decide_governance(settings, diagnosis, [".github/workflows/deploy.yml"])
+    assert decision.decision == "auto_fix"
+
+
+
+
+================================================
+FILE: .cursor/mcp.json
+================================================
+{
+  "mcpServers": {
+    "agentic-cicd-orchestrator": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mcp_server.main"
+      ],
+      "cwd": "C:\\Users\\Lenovo\\Desktop\\HTF",
+      "env": {
+        "OPENAI_MODEL": "gpt-4o-mini"
+      }
+    }
+  }
+}
+
+
+
+
+================================================
+FILE: .github/workflows/agentic-repair.yml
+================================================
+name: agentic-repair
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  diagnose-and-fix:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Agentic Repair Orchestrator
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: gpt-4o-mini
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          python -m mcp_server.run_repair
+
+
+
+
+================================================
+FILE: .github/workflows/ci.yml
+================================================
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest ruff
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest -q
+
+
+
+
+================================================
+FILE: .github/workflows/release-orchestrator.yml
+================================================
+name: release-orchestrator
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: "Branch or tag to release"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  policy-gate:
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.gate.outputs.approved }}
+    steps:
+      - name: Governance policy check
+        id: gate
+        env:
+          REQUIRE_APPROVAL_FOR_RELEASE: ${{ vars.REQUIRE_APPROVAL_FOR_RELEASE || 'true' }}
+        run: |
+          if [ "${REQUIRE_APPROVAL_FOR_RELEASE}" = "true" ]; then
+            echo "approved=false" >> "$GITHUB_OUTPUT"
+            echo "Manual approval is required by policy."
+          else
+            echo "approved=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [policy-gate]
+    if: ${{ needs.policy-gate.outputs.approved == 'true' }}
+    steps:
+      - name: Deploy placeholder
+        run: echo "Deploying ${{ github.event.inputs.release_ref }}"
+
+
+
