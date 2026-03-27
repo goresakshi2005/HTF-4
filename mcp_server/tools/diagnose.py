@@ -21,12 +21,10 @@ Rules:
 - patch must be valid unified diff with file headers:
   --- a/<path>
   +++ b/<path>
-- Include at least ONE unchanged context line above and below each changed block.
-- Use the exact indentation and spaces as shown in the provided file contents.
-- Hunk headers (@@ -old_start,old_count +new_start,new_count @@) must reflect the actual line numbers in the file.
+- **Use exact file paths as they appear in the "Available files" listing below. Do not omit directory prefixes.**
 - Only include files that already exist in provided file contents.
 - Keep patch minimal and focused on fixing failing tests/build.
-- Do not include markdown fences (```).
+- Do not include markdown fences.
 - Prefer using the relevant line-grounded context below when selecting exact lines for patch hunks.
 """
 
@@ -60,20 +58,13 @@ async def diagnose_failure(settings: Settings, context: PipelineContext) -> Diag
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            response = await client.post(
-                "https://api.openai.com/v1/responses",
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
-        except httpx.HTTPStatusError as exc:
-            body = exc.response.text if exc.response is not None else ""
-            raise RuntimeError(
-                f"OpenAI API error {exc.response.status_code if exc.response is not None else '?:'}: {body[:1000]}\n"
-                "Check OPENAI_API_KEY and endpoint access."
-            ) from exc
+        response = await client.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
 
     raw_text = _extract_text_output(data)
     parsed = json.loads(raw_text)
@@ -97,11 +88,14 @@ async def generate_patch_with_llm(
     file_contents: dict[str, str],
     retrieval_context: str,
     previous_attempt_feedback: str = "",
+    files_blob: str = "",
 ) -> PatchGenerationResult:
-    files_blob = "\n\n".join(
-        f"### FILE: {path}\n{content}"
-        for path, content in file_contents.items()
-    )
+    # If files_blob is not provided, build it from file_contents
+    if not files_blob:
+        files_blob = "Available files:\n\n" + "\n\n".join(
+            f"### FILE: {path}\n{content}"
+            for path, content in file_contents.items()
+        )
     payload = {
         "model": settings.OPENAI_MODEL,
         "input": [
@@ -121,7 +115,7 @@ async def generate_patch_with_llm(
                             f"Relevant indexed code context:\n{retrieval_context}\n\n"
                             f"Attempt feedback: {previous_attempt_feedback}\n"
                             f"Logs excerpt:\n{context.logs_excerpt}\n\n"
-                            f"Available files (edit only these):\n{files_blob}\n"
+                            f"{files_blob}\n"
                         ),
                     }
                 ],
@@ -134,24 +128,16 @@ async def generate_patch_with_llm(
         "Content-Type": "application/json",
     }
     async with httpx.AsyncClient(timeout=90.0) as client:
-        try:
-            response = await client.post(
-                "https://api.openai.com/v1/responses",
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
-        except httpx.HTTPStatusError as exc:
-            body = exc.response.text if exc.response is not None else ""
-            raise RuntimeError(
-                f"OpenAI API error {exc.response.status_code if exc.response is not None else '?:'}: {body[:1000]}\n"
-                "Check OPENAI_API_KEY and endpoint access."
-            ) from exc
+        response = await client.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
     raw_text = _extract_text_output(data)
     parsed = json.loads(raw_text)
     result = PatchGenerationResult.model_validate(parsed)
     if len(result.patch) > settings.LLM_PATCH_MAX_CHARS:
         result.patch = result.patch[: settings.LLM_PATCH_MAX_CHARS]
     return result
-

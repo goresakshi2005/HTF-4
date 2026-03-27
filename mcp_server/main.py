@@ -12,6 +12,7 @@ from mcp_server.tools.code_indexing import build_and_query
 from mcp_server.tools.logs_analyzer import (
     extract_failing_tests,
     extract_python_file_candidates,
+    extract_js_file_candidates,
     normalize_logs,
 )
 from mcp_server.tools.pr_bot import open_autofix_pr
@@ -87,25 +88,35 @@ async def orchestrate_autofix(
     context = PipelineContext.model_validate(analysis["context"])
     diagnosis_model = DiagnosisResult.model_validate(analysis["diagnosis"])
 
-    # Fetch candidate file contents at the failing commit SHA.
-    candidates = [p for p in context.changed_files if p.endswith(".py")]
+    # ----- START: Modified candidate selection -----
+    # Start with all changed files
+    candidates = list(context.changed_files)
+
+    # Add Python file candidates from logs
     candidates.extend(extract_python_file_candidates(context.failing_tests))
-    if ("no module named 'app'" in context.logs_excerpt.lower()) and ("app.py" not in candidates):
-        candidates.append("app.py")
-    if "tests/test_app.py" not in candidates:
-        candidates.append("tests/test_app.py")
 
-    prioritized: list[str] = []
-    for p in ["app.py", "tests/test_app.py", "test_app.py"]:
-        if p in candidates and p not in prioritized:
-            prioritized.append(p)
-    for p in candidates:
-        if p not in prioritized:
-            prioritized.append(p)
-    candidates = prioritized
+    # Add JavaScript/TypeScript/JSON candidates from logs
+    candidates.extend(extract_js_file_candidates(context.failing_tests))
 
+    # Detect Node.js project by presence of package.json in changed files
+    if any(f.endswith('package.json') for f in context.changed_files):
+        for extra in ['package.json', 'package-lock.json', 'yarn.lock']:
+            if extra not in candidates:
+                candidates.append(extra)
+
+    # Deduplicate while preserving order
+    candidates = list(dict.fromkeys(candidates))
+
+    # Limit to a reasonable number (MAX_AUTOFIX_FILES is used later in fetching anyway)
+    # We'll fetch all candidates but cap at MAX_AUTOFIX_FILES * 2 to avoid too many requests.
+    max_candidates = settings.MAX_AUTOFIX_FILES * 2
+    if len(candidates) > max_candidates:
+        candidates = candidates[:max_candidates]
+    # ----- END: Modified candidate selection -----
+
+    # Fetch file contents for all candidates
     file_contents: dict[str, str] = {}
-    for path in candidates[: settings.MAX_AUTOFIX_FILES + 2]:
+    for path in candidates:
         content = await github.get_file_content(repository=repository, path=path, ref=context.commit_sha or "main")
         if content:
             file_contents[path] = content
@@ -136,6 +147,11 @@ async def orchestrate_autofix(
     fix_proposal = None
     for attempt in range(1, settings.MAX_REPAIR_ATTEMPTS + 1):
         try:
+            # Build a more explicit file listing for the prompt
+            files_blob = "Available files (use exactly these paths):\n\n" + "\n\n".join(
+                f"### FILE: {path}\n{content}"
+                for path, content in file_contents.items()
+            )
             patch_result = await generate_patch_with_llm(
                 settings=settings,
                 context=context,
@@ -143,6 +159,7 @@ async def orchestrate_autofix(
                 file_contents=file_contents,
                 retrieval_context=retrieval_context,
                 previous_attempt_feedback=feedback,
+                files_blob=files_blob,  # pass the explicit listing
             )
             attempt_logs.append(
                 RepairAttempt(
@@ -208,4 +225,3 @@ async def orchestrate_autofix(
 
 if __name__ == "__main__":
     mcp.run()
-

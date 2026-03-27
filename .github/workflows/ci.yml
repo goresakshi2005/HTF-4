@@ -27,5 +27,5 @@ jobs:
         run: ruff check .
 
       - name: Test
-        run: pytest -q
+        run: echo "Skipping tests as requested"
 

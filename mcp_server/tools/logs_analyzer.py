@@ -41,3 +41,15 @@ def extract_python_file_candidates(items: list[str]) -> list[str]:
                 candidates.append(token)
     return candidates
 
+
+def extract_js_file_candidates(items: list[str]) -> list[str]:
+    """Extract paths to JavaScript/TypeScript/JSON files from error messages."""
+    candidates: list[str] = []
+    for item in items:
+        normalized = item.replace("\\", "/")
+        for token in normalized.replace(":", " ").split():
+            token = token.strip(" ,.;:()[]{}'\"")
+            if any(token.endswith(ext) for ext in ['.js', '.jsx', '.ts', '.tsx', '.json']) and '/' in token:
+                if token not in candidates:
+                    candidates.append(token)
+    return candidates
