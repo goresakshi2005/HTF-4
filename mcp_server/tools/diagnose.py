@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-
 import httpx
 
 from mcp_server.config import Settings
@@ -96,6 +95,32 @@ async def generate_patch_with_llm(
             f"### FILE: {path}\n{content}"
             for path, content in file_contents.items()
         )
+
+    # Add special instruction for JSON files
+    json_files = [path for path in file_contents.keys() if path.endswith('.json')]
+    additional_instruction = ""
+    if json_files:
+        additional_instruction = (
+            "\n\nImportant: For JSON files, output the **complete corrected content** of the file, "
+            "not a diff. Use a JSON object with keys 'patch' (the full new content) and 'rationale'. "
+            "The 'patch' field must contain the whole file content, not a diff. "
+            "The 'touched_files' should list exactly the file path."
+        )
+
+    user_prompt = (
+        f"Repository: {context.repository}\n"
+        f"Run ID: {context.run_id}\n"
+        f"Diagnosis summary: {diagnosis.summary}\n"
+        f"Root cause: {diagnosis.root_cause}\n"
+        f"Proposed fix: {diagnosis.proposed_fix}\n"
+        f"Failing tests: {context.failing_tests}\n"
+        f"Relevant indexed code context:\n{retrieval_context}\n\n"
+        f"Attempt feedback: {previous_attempt_feedback}\n"
+        f"Logs excerpt:\n{context.logs_excerpt}\n\n"
+        f"{files_blob}\n"
+        f"{additional_instruction}"
+    )
+
     payload = {
         "model": settings.OPENAI_MODEL,
         "input": [
@@ -103,21 +128,7 @@ async def generate_patch_with_llm(
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            f"Repository: {context.repository}\n"
-                            f"Run ID: {context.run_id}\n"
-                            f"Diagnosis summary: {diagnosis.summary}\n"
-                            f"Root cause: {diagnosis.root_cause}\n"
-                            f"Proposed fix: {diagnosis.proposed_fix}\n"
-                            f"Failing tests: {context.failing_tests}\n"
-                            f"Relevant indexed code context:\n{retrieval_context}\n\n"
-                            f"Attempt feedback: {previous_attempt_feedback}\n"
-                            f"Logs excerpt:\n{context.logs_excerpt}\n\n"
-                            f"{files_blob}\n"
-                        ),
-                    }
+                    {"type": "input_text", "text": user_prompt}
                 ],
             },
         ],
